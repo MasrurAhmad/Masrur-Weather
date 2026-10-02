@@ -1,0 +1,2313 @@
+import tkinter as tk
+from tkinter import ttk
+from datetime import datetime, timedelta
+import os
+import threading
+import math
+
+
+class MasrurWeather:
+    # ── Colour palette ────────────────────────────────────────────
+    BG         = "#0a1628"
+    CARD       = "#142238"
+    CARD2      = "#0f2040"
+    BORDER     = "#1e3454"
+    ACCENT     = "#3a7bd5"
+    ACCENT2    = "#5bc5e8"
+    TEXT       = "#e8edf5"
+    TEXT2      = "#c8daf5"
+    TEXT3      = "#7ab3e8"
+    MUTED      = "#4a7aab"
+    MUTED2     = "#3a5a7a"
+    WARN       = "#e8a060"
+    DANGER     = "#e85a60"
+    GOOD       = "#5bc5e8"
+
+    _WX = {
+        0:  ('☀️',  'Clear'),
+        1:  ('🌤️', 'Mostly Clear'),
+        2:  ('⛅',  'Partly Cloudy'),
+        3:  ('☁️',  'Cloudy'),
+        45: ('🌫️', 'Fog'),
+        48: ('🌫️', 'Fog'),
+        51: ('🌦️', 'Drizzle'),
+        53: ('🌦️', 'Drizzle'),
+        55: ('🌦️', 'Drizzle'),
+        61: ('🌧️', 'Rain'),
+        63: ('🌧️', 'Rain'),
+        65: ('🌧️', 'Heavy Rain'),
+        71: ('🌨️', 'Snow'),
+        73: ('❄️',  'Snow'),
+        75: ('🌨️', 'Heavy Snow'),
+        77: ('🌨️', 'Snow'),
+        80: ('🌦️', 'Showers'),
+        81: ('🌦️', 'Showers'),
+        82: ('⛈️',  'Showers'),
+        85: ('🌨️', 'Snow'),
+        86: ('🌨️', 'Snow'),
+        95: ('⛈️',  'Thunderstorm'),
+        96: ('⛈️',  'Thunderstorm'),
+        99: ('⛈️',  'Thunderstorm'),
+    }
+    _WX_DESC = {
+        0: 'Clear skies expected throughout the day.',
+        1: 'Mostly clear with some light clouds.',
+        2: 'Partly cloudy skies expected.',
+        3: 'Overcast and cloudy conditions.',
+        45: 'Foggy conditions, reduced visibility.',
+        61: 'Rain expected. Carry an umbrella.',
+        63: 'Moderate rainfall expected.',
+        65: 'Heavy rainfall — stay indoors if possible.',
+        80: 'Scattered showers throughout the day.',
+        95: 'Thunderstorm activity — take caution.',
+        99: 'Severe thunderstorms expected.',
+    }
+    MONTHS   = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    DAYS_S   = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+    DAYS_F   = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Masrur Weather")
+        self.root.state('zoomed')
+        self.root.minsize(1100, 720)
+        self.root.configure(bg=self.BG)
+
+        self.unit         = "celsius"
+        self.weather_data = None
+        self.last_city    = ''
+        self.last_country = ''
+        self._spinner_running = False
+        self._spinner_angle   = 0
+        # Guards against scrolling a canvas while its content is mid-rebuild.
+        # Without this, a wheel event can read a stale scrollregion (captured
+        # before destroy()/pack() calls finish settling) and jump the
+        # viewport to an offset that no longer matches the new layout once
+        # Tk catches up.
+        self._render_lock = False
+
+        self.root.rowconfigure(0, weight=0)
+        self.root.rowconfigure(1, weight=1)
+        self.root.columnconfigure(0, weight=1)
+
+        self._build_topbar()
+        self._build_screens()
+        self._show('welcome')
+        # Paint the window immediately before doing any I/O
+        self.root.update()
+        # Defer last-city lookup so the welcome screen appears in <100 ms
+        self.root.after(80, self._load_last_city)
+
+    # ══════════════════════════════════════════════════════════════
+    # TOP BAR
+    # ══════════════════════════════════════════════════════════════
+    def _build_topbar(self):
+        bar = tk.Frame(self.root, bg=self.CARD2, pady=0)
+        bar.grid(row=0, column=0, sticky='ew')
+        bar.columnconfigure(1, weight=1)
+
+        # Logo
+        logo = tk.Frame(bar, bg=self.CARD2)
+        logo.grid(row=0, column=0, padx=(16,8), pady=8, sticky='w')
+        tk.Label(logo, text="❄️", font=("Segoe UI", 18), bg=self.CARD2).pack(side='left')
+        tk.Label(logo, text=" Masrur", font=("Segoe UI", 14, "bold"),
+                 bg=self.CARD2, fg=self.ACCENT2).pack(side='left')
+        tk.Label(logo, text=" Weather", font=("Segoe UI", 14),
+                 bg=self.CARD2, fg=self.TEXT2).pack(side='left')
+
+        # City tab (shows active city)
+        self.city_tab = tk.Frame(bar, bg="#162d50", relief='flat', bd=1)
+        self.city_tab.grid(row=0, column=1, padx=8, pady=8, sticky='w')
+        self.tab_city  = tk.Label(self.city_tab, text="--", font=("Segoe UI", 11),
+                                  bg="#162d50", fg=self.TEXT2, padx=10, pady=4)
+        self.tab_city.pack(side='left')
+        self.tab_temp  = tk.Label(self.city_tab, text="", font=("Segoe UI", 11),
+                                  bg="#162d50", fg=self.ACCENT2, padx=4, pady=4)
+        self.tab_temp.pack(side='left')
+
+        # Right controls
+        right = tk.Frame(bar, bg=self.CARD2)
+        right.grid(row=0, column=2, padx=16, pady=8, sticky='e')
+
+        self.search_var = tk.StringVar()
+        search_frame = tk.Frame(right, bg=self.CARD, highlightbackground=self.BORDER,
+                                highlightthickness=1)
+        search_frame.pack(side='left', padx=(0, 6))
+        self.search_entry = tk.Entry(search_frame, textvariable=self.search_var,
+                                     width=22, font=("Segoe UI", 11),
+                                     bg=self.CARD, fg=self.TEXT2, relief='flat', bd=6,
+                                     insertbackground=self.TEXT2)
+        self.search_entry.pack(side='left')
+        self.search_entry.bind('<Return>', lambda e: self._do_search())
+        self.search_entry.insert(0, "Search city...")
+        self.search_entry.bind('<FocusIn>',  lambda e: self._clear_placeholder())
+        self.search_entry.bind('<FocusOut>', lambda e: self._restore_placeholder())
+        tk.Button(search_frame, text="🔍", command=self._do_search,
+                  bg=self.ACCENT, fg='white', font=("Segoe UI", 11),
+                  padx=10, bd=0, cursor='hand2', relief='flat').pack(side='left')
+
+        tk.Button(right, text="📍", command=self._do_location,
+                  bg=self.CARD, fg=self.TEXT3, font=("Segoe UI", 11),
+                  padx=10, bd=0, cursor='hand2', relief='flat',
+                  highlightbackground=self.BORDER, highlightthickness=1
+                  ).pack(side='left', padx=(0, 8))
+
+        unit_frame = tk.Frame(right, bg=self.BORDER, padx=1, pady=1)
+        unit_frame.pack(side='left')
+        self.c_btn = tk.Button(unit_frame, text="°C", command=lambda: self._set_unit('celsius'),
+                               bg=self.ACCENT, fg='white', font=("Segoe UI", 10, "bold"),
+                               padx=12, pady=3, bd=0, cursor='hand2', relief='flat')
+        self.c_btn.pack(side='left')
+        self.f_btn = tk.Button(unit_frame, text="°F", command=lambda: self._set_unit('fahrenheit'),
+                               bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 10),
+                               padx=12, pady=3, bd=0, cursor='hand2', relief='flat')
+        self.f_btn.pack(side='left')
+
+    # ══════════════════════════════════════════════════════════════
+    # SCREEN CONTAINER
+    # ══════════════════════════════════════════════════════════════
+    def _build_screens(self):
+        self.container = tk.Frame(self.root, bg=self.BG)
+        self.container.grid(row=1, column=0, sticky='nsew')
+        self.container.rowconfigure(0, weight=1)
+        self.container.columnconfigure(0, weight=1)
+
+        self._build_welcome()
+        self._build_loading()
+        self._build_error()
+        self._build_main()
+
+    def _show(self, name):
+        mapping = {
+            'welcome': self.welcome_frame,
+            'loading': self.loading_frame,
+            'error':   self.error_frame,
+            'main':    self.main_frame,
+        }
+        for w in mapping.values():
+            w.grid_remove()
+        mapping[name].grid(row=0, column=0, sticky='nsew')
+        if name == 'loading':
+            self.root.after(1, self._start_spinner)
+        else:
+            self._stop_spinner()
+
+    # ══════════════════════════════════════════════════════════════
+    # WELCOME SCREEN
+    # ══════════════════════════════════════════════════════════════
+    def _build_welcome(self):
+        f = self.welcome_frame = tk.Frame(self.container, bg=self.CARD2)
+        inner = tk.Frame(f, bg=self.CARD2)
+        inner.place(relx=0.5, rely=0.45, anchor='center')
+
+        tk.Label(inner, text="🌍", font=("Segoe UI", 72), bg=self.CARD2).pack(pady=(0,12))
+        tk.Label(inner, text="Search for a city",
+                 font=("Segoe UI", 26, "bold"), bg=self.CARD2, fg=self.TEXT).pack()
+        tk.Label(inner, text="Get 7-day and 15-day weather forecast",
+                 font=("Segoe UI", 13), bg=self.CARD2, fg=self.MUTED).pack(pady=(6,20))
+
+        btn_row = tk.Frame(inner, bg=self.CARD2)
+        btn_row.pack()
+        for city in ["Dhaka", "London", "New York", "Tokyo", "Sydney"]:
+            tk.Button(btn_row, text=city,
+                      command=lambda c=city: self._do_search(c),
+                      bg=self.CARD, fg=self.TEXT2,
+                      font=("Segoe UI", 10, "bold"),
+                      relief='flat', padx=18, pady=8, bd=0, cursor='hand2',
+                      highlightbackground=self.BORDER, highlightthickness=1
+                      ).pack(side='left', padx=6)
+
+    # ══════════════════════════════════════════════════════════════
+    # LOADING SCREEN  (animated spinner)
+    # ══════════════════════════════════════════════════════════════
+    def _build_loading(self):
+        f = self.loading_frame = tk.Frame(self.container, bg=self.CARD2)
+        inner = tk.Frame(f, bg=self.CARD2)
+        inner.place(relx=0.5, rely=0.45, anchor='center')
+        self._spinner_cv = tk.Canvas(inner, width=72, height=72,
+                                     bg=self.CARD2, highlightthickness=0)
+        self._spinner_cv.pack(pady=(0,18))
+        tk.Label(inner, text="Loading weather data…",
+                 font=("Segoe UI", 14), bg=self.CARD2, fg=self.ACCENT2).pack()
+
+    def _start_spinner(self):
+        self._spinner_running = True
+        self._tick_spinner()
+
+    def _stop_spinner(self):
+        self._spinner_running = False
+
+    def _tick_spinner(self):
+        if not self._spinner_running:
+            return
+        c = self._spinner_cv
+        c.delete('all')
+        # Outer faint ring
+        c.create_oval(6, 6, 66, 66, outline=self.BORDER, width=4)
+        # Spinning arc (270° sweep, head slightly brighter)
+        c.create_arc(6, 6, 66, 66,
+                     start=self._spinner_angle, extent=270,
+                     outline=self.ACCENT, width=4, style='arc')
+        # Bright leading dot
+        import math
+        rad = math.radians(self._spinner_angle + 270 - 90)
+        cx = cy = 36
+        r  = 30
+        dx = cx + r * math.cos(rad)
+        dy = cy + r * math.sin(rad)
+        c.create_oval(dx-4, dy-4, dx+4, dy+4,
+                      fill=self.ACCENT2, outline='')
+        self._spinner_angle = (self._spinner_angle + 8) % 360
+        c.after(12, self._tick_spinner)
+
+    # ══════════════════════════════════════════════════════════════
+    # ERROR SCREEN
+    # ══════════════════════════════════════════════════════════════
+    def _build_error(self):
+        f = self.error_frame = tk.Frame(self.container, bg=self.CARD2)
+        inner = tk.Frame(f, bg=self.CARD2)
+        inner.place(relx=0.5, rely=0.45, anchor='center')
+        tk.Label(inner, text="⚠️", font=("Segoe UI", 52), bg=self.CARD2, fg=self.WARN).pack(pady=(0,12))
+        self.error_msg = tk.Label(inner, text="Something went wrong",
+                                  font=("Segoe UI", 13), bg=self.CARD2, fg=self.WARN,
+                                  wraplength=520, justify='center')
+        self.error_msg.pack(pady=(0,6))
+        self.error_detail = tk.Label(inner, text="",
+                                     font=("Segoe UI", 9), bg=self.CARD2, fg=self.MUTED,
+                                     wraplength=520, justify='center')
+        self.error_detail.pack(pady=(0,14))
+        tk.Button(inner, text="Try Again", command=lambda: self._do_search(self.last_city),
+                  bg=self.ACCENT, fg='white', font=("Segoe UI", 11, "bold"),
+                  relief='flat', padx=20, pady=8, bd=0, cursor='hand2').pack()
+
+    # ══════════════════════════════════════════════════════════════
+    # MAIN WEATHER SCREEN
+    # ══════════════════════════════════════════════════════════════
+    def _build_main(self):
+        f = self.main_frame = tk.Frame(self.container, bg=self.BG)
+        f.rowconfigure(0, weight=1)
+        f.columnconfigure(0, weight=1)
+        f.columnconfigure(1, weight=0)
+
+        self._style_scrollbars()
+
+        # ── Centre column: canvas + a REAL, visible vertical scrollbar ──
+        # Scrolling is now entirely delegated to Tk's own scrollbar/canvas
+        # protocol (Scrollbar.command -> canvas.yview, canvas.yscrollcommand
+        # -> Scrollbar.set). That's the same plumbing every Tk app has used
+        # for 25+ years; it's what actually repaints correctly, unlike the
+        # hand-rolled fractional yview_moveto() jumps used previously.
+        main_col = tk.Frame(f, bg=self.BG)
+        main_col.grid(row=0, column=0, sticky='nsew')
+        main_col.rowconfigure(0, weight=1)
+        main_col.columnconfigure(0, weight=1)
+        main_col.columnconfigure(1, weight=0)
+
+        main_cv = tk.Canvas(main_col, bg=self.BG, highlightthickness=0,
+                            yscrollincrement=1)
+        main_cv.grid(row=0, column=0, sticky='nsew')
+        self._main_cv = main_cv
+
+        main_vbar = ttk.Scrollbar(main_col, orient='vertical',
+                                  style='Weather.Vertical.TScrollbar',
+                                  command=main_cv.yview)
+        main_vbar.grid(row=0, column=1, sticky='ns')
+        main_cv.configure(yscrollcommand=main_vbar.set)
+        self._main_vbar = main_vbar
+
+        self.center = tk.Frame(main_cv, bg=self.BG)
+        self._canvas_win = main_cv.create_window((0, 0), window=self.center, anchor='nw')
+        main_cv.bind('<Configure>',
+            lambda e: main_cv.itemconfig(self._canvas_win, width=e.width))
+        self.center.bind('<Configure>', lambda e: self._sync_scrollregion(main_cv))
+
+        # ── Sidebar column: canvas + its own real vertical scrollbar ────
+        sb_outer = tk.Frame(f, bg=self.BG, width=246)
+        sb_outer.grid(row=0, column=1, sticky='nsew')
+        sb_outer.grid_propagate(False)
+        sb_outer.rowconfigure(0, weight=1)
+        sb_outer.columnconfigure(0, weight=1)
+        sb_outer.columnconfigure(1, weight=0)
+
+        sb_cv = tk.Canvas(sb_outer, bg=self.BG, highlightthickness=0,
+                          yscrollincrement=1)
+        sb_cv.grid(row=0, column=0, sticky='nsew')
+        self._sb_cv = sb_cv
+
+        sb_vbar = ttk.Scrollbar(sb_outer, orient='vertical',
+                                style='Weather.Vertical.TScrollbar',
+                                command=sb_cv.yview)
+        sb_vbar.grid(row=0, column=1, sticky='ns')
+        sb_cv.configure(yscrollcommand=sb_vbar.set)
+        self._sb_vbar = sb_vbar
+
+        self.sidebar = tk.Frame(sb_cv, bg=self.BG)
+        self._sb_win = sb_cv.create_window((0, 0), window=self.sidebar, anchor='nw')
+        self.sidebar.bind('<Configure>', lambda e: self._sync_scrollregion(sb_cv))
+        sb_cv.bind('<Configure>',
+            lambda e: sb_cv.itemconfig(self._sb_win, width=e.width))
+
+        # ── Mouse wheel: a thin convenience on top of the scrollbar ─────
+        # Each notch just asks Tk to move by a few of its own native
+        # "units" (1 unit == 1px, since yscrollincrement=1 above) — the
+        # same call a click on the scrollbar's trough would make. No
+        # fraction math, no manual repaint forcing: this is Tk's own
+        # scroll path, the same one the visible scrollbar thumb uses.
+        self._scroll_target = main_cv
+
+        def _on_wheel(event):
+            if self._render_lock:
+                return
+            self._scroll_target.yview_scroll(int(-event.delta / 2), 'units')
+
+        # Route wheel to the canvas the mouse is currently hovering over
+        for widget in (main_cv, self.center):
+            widget.bind('<Enter>', lambda e, c=main_cv:
+                        setattr(self, '_scroll_target', c), add='+')
+        for widget in (sb_cv, self.sidebar):
+            widget.bind('<Enter>', lambda e, c=sb_cv:
+                        setattr(self, '_scroll_target', c), add='+')
+
+        self.root.bind_all('<MouseWheel>', _on_wheel)
+
+        self._build_center_widgets()
+        self._build_sidebar_widgets()
+
+    # ── Dark-themed scrollbar matching the rest of the UI ───────────
+    def _style_scrollbars(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Weather.Vertical.TScrollbar',
+                        background=self.BORDER, troughcolor=self.BG,
+                        bordercolor=self.BG, arrowcolor=self.TEXT3,
+                        relief='flat', width=12)
+        style.map('Weather.Vertical.TScrollbar',
+                  background=[('active', self.ACCENT), ('pressed', self.ACCENT)])
+        style.configure('Weather.Horizontal.TScrollbar',
+                        background=self.BORDER, troughcolor=self.CARD,
+                        bordercolor=self.CARD, arrowcolor=self.TEXT3,
+                        relief='flat', width=10)
+        style.map('Weather.Horizontal.TScrollbar',
+                  background=[('active', self.ACCENT), ('pressed', self.ACCENT)])
+
+    # ── Force a canvas's scrollregion to match its CURRENT content ──
+    def _sync_scrollregion(self, cv):
+        """Flush pending geometry work, then recompute scrollregion.
+
+        A single render pass can destroy/recreate a dozen child widgets
+        in a row (forecast cards, table rows, insight cards), each
+        potentially queuing its own resize before Tk has settled the
+        previous one. Forcing idle tasks to run before reading bbox('all')
+        avoids capturing a transitional (too-small) bounding box, which
+        is what the real scrollbar's thumb size/position is computed from.
+        """
+        try:
+            cv.update_idletasks()
+            bbox = cv.bbox('all')
+            if bbox:
+                cv.configure(scrollregion=bbox)
+        except tk.TclError:
+            pass
+
+    # ─────────────────────────────────────────────────────────────
+    def _build_center_widgets(self):
+        c = self.center
+        PAD = dict(padx=14, pady=(6,0))
+
+        # City header
+        hdr = tk.Frame(c, bg=self.BG)
+        hdr.pack(fill='x', padx=14, pady=(12,4))
+        self.lbl_city    = tk.Label(hdr, text="--", font=("Segoe UI", 20, "bold"),
+                                    bg=self.BG, fg=self.TEXT)
+        self.lbl_city.pack(side='left')
+        self.lbl_country = tk.Label(hdr, text="", font=("Segoe UI", 12),
+                                    bg=self.BG, fg=self.MUTED)
+        self.lbl_country.pack(side='left', padx=(8, 0))
+
+        # ── Current weather card ──────────────────────────────────
+        self._build_current_card(c)
+
+        # ── 7-day forecast ────────────────────────────────────────
+        tk.Label(c, text="📅  7-Day Forecast",
+                 font=("Segoe UI", 11, "bold"), bg=self.BG, fg=self.TEXT3
+                 ).pack(fill='x', padx=14, pady=(10,4))
+        self.fc_frame = tk.Frame(c, bg=self.BG)
+        self.fc_frame.pack(fill='x', padx=14, pady=(0,4))
+
+        # ── Day detail panel (shown when a forecast card is clicked) ──
+        self._selected_day_idx = None
+        self._fc_cards         = []          # references for highlight tracking
+        self._dd_wrapper = tk.Frame(c, bg=self.BG)  # always in layout
+        self._dd_wrapper.pack(fill='x')
+        self._build_day_detail_panel(self._dd_wrapper)
+
+        # ── Hourly forecast ───────────────────────────────────────
+        self._build_hourly_section(c)
+
+        # ── 35-day table ──────────────────────────────────────────
+        tk.Label(c, text="📆  30-Day Forecast",
+                 font=("Segoe UI", 11, "bold"), bg=self.BG, fg=self.TEXT3
+                 ).pack(fill='x', padx=14, pady=(8,4))
+        self._build_table(c)
+
+        # ── Insights ──────────────────────────────────────────────
+        tk.Label(c, text="🔍  Weather Insights",
+                 font=("Segoe UI", 11, "bold"), bg=self.BG, fg=self.TEXT3
+                 ).pack(fill='x', padx=14, pady=(10,4))
+        self.ins_frame = tk.Frame(c, bg=self.BG)
+        self.ins_frame.pack(fill='x', padx=14, pady=(0,16))
+
+    # ─────────────────────────────────────────────────────────────
+    def _build_day_detail_panel(self, wrapper):
+        """Build the collapsible day-detail panel (hidden by default)."""
+        outer = self._dd_outer = tk.Frame(
+            wrapper, bg=self.CARD,
+            highlightbackground=self.ACCENT, highlightthickness=1)
+        # NOT packed yet — shown on demand
+
+        # ── Header ────────────────────────────────────────────────
+        hdr = tk.Frame(outer, bg=self.CARD)
+        hdr.pack(fill='x', padx=14, pady=(10,6))
+        self._dd_icon  = tk.Label(hdr, text="⛅", font=("Segoe UI", 28), bg=self.CARD)
+        self._dd_icon.pack(side='left', padx=(0,10))
+        ttl = tk.Frame(hdr, bg=self.CARD)
+        ttl.pack(side='left')
+        self._dd_day_lbl  = tk.Label(ttl, text="--", font=("Segoe UI", 14, "bold"),
+                                     bg=self.CARD, fg=self.ACCENT2)
+        self._dd_day_lbl.pack(anchor='w')
+        self._dd_date_lbl = tk.Label(ttl, text="--", font=("Segoe UI", 10),
+                                     bg=self.CARD, fg=self.MUTED)
+        self._dd_date_lbl.pack(anchor='w')
+        self._dd_cond_lbl = tk.Label(ttl, text="--", font=("Segoe UI", 10),
+                                     bg=self.CARD, fg=self.TEXT3)
+        self._dd_cond_lbl.pack(anchor='w')
+
+        # ── Stat tiles (8) ────────────────────────────────────────
+        stats_row = tk.Frame(outer, bg=self.CARD)
+        stats_row.pack(fill='x', padx=14, pady=(0,10))
+        self._dd_stats = {}
+        for key, icon, label in [
+            ('high',    '🌡️', 'High'),
+            ('low',     '❄️',  'Low'),
+            ('feels',   '🤔', 'Feels Like'),
+            ('rain',    '💧', 'Rain'),
+            ('wind',    '💨', 'Wind'),
+            ('uv',      '🔆', 'UV Index'),
+            ('sunrise', '🌅', 'Sunrise'),
+            ('sunset',  '🌇', 'Sunset'),
+        ]:
+            tile = tk.Frame(stats_row, bg=self.BG,
+                            highlightbackground=self.BORDER, highlightthickness=1)
+            tile.pack(side='left', padx=3, fill='both', expand=True)
+            tk.Label(tile, text=icon, font=("Segoe UI", 13), bg=self.BG).pack(pady=(7,1))
+            tk.Label(tile, text=label, font=("Segoe UI", 7), bg=self.BG,
+                     fg=self.MUTED2).pack()
+            v = tk.Label(tile, text="--", font=("Segoe UI", 10, "bold"),
+                         bg=self.BG, fg=self.TEXT2)
+            v.pack(pady=(1,7))
+            self._dd_stats[key] = v
+
+        # ── 24-hour chart ─────────────────────────────────────────
+        tk.Label(outer, text="24-Hour Forecast", font=("Segoe UI", 9, "bold"),
+                 bg=self.CARD, fg=self.MUTED).pack(anchor='w', padx=14, pady=(4,2))
+        chart_frame = tk.Frame(outer, bg=self.CARD)
+        chart_frame.pack(fill='x', padx=8, pady=(0,4))
+        self._dd_cv = tk.Canvas(chart_frame, bg=self.CARD, height=170,
+                                highlightthickness=0)
+        self._dd_cv.pack(fill='x', expand=True)
+
+        # ── Hourly rows (every 3h) ────────────────────────────────
+        self._dd_hourly_frame = tk.Frame(outer, bg=self.CARD)
+        self._dd_hourly_frame.pack(fill='x', padx=14, pady=(0,12))
+
+    def _show_day_detail(self, day_idx):
+        """Toggle or switch day detail panel."""
+        if self._selected_day_idx == day_idx:
+            self._close_day_detail(); return
+
+        self._selected_day_idx = day_idx
+        self._update_card_highlights()
+
+        d = self.weather_data.get('daily',  {})
+        h = self.weather_data.get('hourly', {})
+
+        codes  = d.get('weather_code', [])
+        t_max  = d.get('temperature_2m_max', [])
+        t_min  = d.get('temperature_2m_min', [])
+        t_app  = d.get('apparent_temperature_max', [])
+        precip = d.get('precipitation_probability_max', [])
+        wind   = d.get('wind_speed_10m_max', [])
+        uv     = d.get('uv_index_max', [])
+        times  = d.get('time', [])
+        sunrises = d.get('sunrise', [])
+        sunsets  = d.get('sunset',  [])
+
+        i = day_idx
+        ic, cn = self._wx(codes[i] if i < len(codes) else 0)
+        try:
+            dt      = datetime.fromisoformat(times[i])
+            day_str = 'Today' if i == 0 else self.DAYS_F[dt.weekday()]
+            date_str= f"{self.MONTHS[dt.month-1]} {dt.day}, {dt.year}"
+        except Exception:
+            day_str = f"Day {i+1}"; date_str = ''
+
+        hi   = self._c(t_max[i])  if i < len(t_max)  else '--'
+        lo   = self._c(t_min[i])  if i < len(t_min)  else '--'
+        rain = precip[i]          if i < len(precip) else 0
+        wnd  = round(wind[i])     if i < len(wind)   else '--'
+        uvi  = round(uv[i], 1)   if i < len(uv)     else '--'
+
+        sr_str = ss_str = '--'
+        if i < len(sunrises) and sunrises[i]:
+            try: sr_str = datetime.fromisoformat(sunrises[i].replace('Z','')).strftime('%I:%M %p')
+            except: pass
+        if i < len(sunsets) and sunsets[i]:
+            try: ss_str = datetime.fromisoformat(sunsets[i].replace('Z','')).strftime('%I:%M %p')
+            except: pass
+
+        # Feels-like: use current if today, else estimate from t_max
+        feels = '--'
+        if i == 0:
+            feels = f"{self._c(self.weather_data.get('current',{}).get('apparent_temperature', t_max[i] if i<len(t_max) else 0))}°"
+        elif i < len(t_max):
+            feels = f"{self._c(t_max[i] - 1)}°"   # rough estimate
+
+        self._dd_icon.config(text=ic)
+        self._dd_day_lbl.config(text=day_str)
+        self._dd_date_lbl.config(text=date_str)
+        self._dd_cond_lbl.config(text=cn)
+        self._dd_stats['high'].config(text=f"{hi}°",    fg=self.WARN)
+        self._dd_stats['low'].config( text=f"{lo}°",    fg=self.ACCENT2)
+        self._dd_stats['feels'].config(text=feels,      fg=self.TEXT2)
+        self._dd_stats['rain'].config( text=f"{rain}%", fg=self.ACCENT2 if rain<50 else self.WARN)
+        self._dd_stats['wind'].config( text=f"{wnd} km/h", fg=self.TEXT2)
+        self._dd_stats['uv'].config(   text=str(uvi),   fg=self.WARN if float(uvi or 0)>=6 else self.TEXT2)
+        self._dd_stats['sunrise'].config(text=sr_str,   fg=self.TEXT2)
+        self._dd_stats['sunset'].config( text=ss_str,   fg=self.TEXT2)
+
+        self._draw_day_detail_chart(i, h)
+        self._draw_day_hourly_rows(i, h)
+
+        # Show panel
+        self._dd_outer.pack(fill='x', padx=14, pady=(0,8))
+        # The panel adds a tall block into self.center; resync immediately
+        # so a scroll right after clicking a day card doesn't use the
+        # pre-expansion bounds.
+        self._sync_scrollregion(self._main_cv)
+
+    def _close_day_detail(self):
+        self._selected_day_idx = None
+        self._dd_outer.pack_forget()
+        self._update_card_highlights()
+        self._sync_scrollregion(self._main_cv)
+
+    def _update_card_highlights(self):
+        """Refresh card border/bg to reflect which day is selected."""
+        for idx, (card, is_today) in enumerate(self._fc_cards):
+            selected = (idx == self._selected_day_idx)
+            if selected:
+                bg = "#1a3568"; bdr = self.ACCENT2
+            elif is_today:
+                bg = "#162d50"; bdr = self.ACCENT
+            else:
+                bg = self.CARD;  bdr = self.BORDER
+            try:
+                card.config(bg=bg, highlightbackground=bdr)
+                for child in card.winfo_children():
+                    try: child.config(bg=bg)
+                    except tk.TclError: pass
+            except tk.TclError:
+                pass
+
+    def _draw_day_detail_chart(self, day_idx, hourly):
+        """Draw a 24-hour temperature curve for the selected day."""
+        c = self._dd_cv
+        c.delete('all')
+        c.update_idletasks()
+        W = max(c.winfo_width(), 600)
+
+        h_temps = hourly.get('temperature_2m', [])
+        h_codes = hourly.get('weather_code', [])
+        h_rain  = hourly.get('precipitation_probability', [])
+
+        base = day_idx * 24
+        temps, codes_h, rains = [], [], []
+        for j in range(24):
+            idx = base + j
+            temps.append(float(h_temps[idx]) if idx < len(h_temps) else 0)
+            codes_h.append(h_codes[idx] if idx < len(h_codes) else 0)
+            rains.append(h_rain[idx]    if idx < len(h_rain)  else 0)
+
+        if not temps: return
+
+        PAD_L=30; PAD_R=20; PAD_T=28; PAD_B=16
+        CHART_H = 170 - PAD_T - PAD_B
+        mn = min(temps) - 1.5
+        mx = max(temps) + 2.5
+        span = max(mx - mn, 1)
+        col_w = (W - PAD_L - PAD_R) / 23
+
+        def xof(j): return PAD_L + j * col_w
+        def yof(t): return PAD_T + (1 - (t - mn) / span) * CHART_H
+
+        raw = [(xof(j), yof(temps[j])) for j in range(24)]
+
+        def cr(pts):
+            out = []
+            n = len(pts)
+            for i in range(n - 1):
+                p0,p1,p2,p3 = pts[max(i-1,0)],pts[i],pts[i+1],pts[min(i+2,n-1)]
+                for k in range(14):
+                    t = k/14; t2,t3 = t*t,t*t*t
+                    x = .5*(2*p1[0]+(-p0[0]+p2[0])*t+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t3)
+                    y = .5*(2*p1[1]+(-p0[1]+p2[1])*t+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t3)
+                    out.append((x, y))
+            out.append(pts[-1]); return out
+
+        smooth = cr(raw)
+        fill_pts = [(smooth[0][0], PAD_T + CHART_H + 5)] + smooth + [(smooth[-1][0], PAD_T + CHART_H + 5)]
+        c.create_polygon(fill_pts, fill='#0e2344', outline='')
+        flat = [v for pt in smooth for v in pt]
+        if len(flat) >= 4:
+            c.create_line(flat, fill='#4a9be0', width=2, smooth=False)
+
+        # Dots + temp label every 3h. The icon/time/rain captions that used
+        # to sit under the curve here were an exact duplicate of the tile
+        # row _draw_day_hourly_rows draws right below this chart, so the
+        # same 8 data points were shown twice in a row — removed.
+        for j in range(24):
+            x, y = raw[j]
+            c.create_oval(x-3, y-3, x+3, y+3, fill='#5bc5e8', outline='#0a1628', width=1)
+            if j % 3 == 0:
+                c.create_text(x, y - 13, text=f"{self._c(temps[j])}°",
+                              font=('Segoe UI', 8, 'bold'), fill='#c8daf5')
+
+    def _draw_day_hourly_rows(self, day_idx, hourly):
+        """Draw 8 three-hourly summary tiles below the chart."""
+        for w in self._dd_hourly_frame.winfo_children():
+            w.destroy()
+
+        h_temps = hourly.get('temperature_2m', [])
+        h_codes = hourly.get('weather_code', [])
+        h_rain  = hourly.get('precipitation_probability', [])
+        h_wind  = hourly.get('wind_speed_10m', []) if 'wind_speed_10m' in hourly else []
+        base    = day_idx * 24
+
+        for j in range(0, 24, 3):
+            idx = base + j
+            temp = float(h_temps[idx]) if idx < len(h_temps) else 0
+            code = h_codes[idx]        if idx < len(h_codes) else 0
+            rain = h_rain[idx]         if idx < len(h_rain)  else 0
+            ic, cn = self._wx(code)
+            h_label = f"{'12' if j%12==0 else j%12}:00 {'AM' if j<12 else 'PM'}"
+            if j == 0: h_label = '12:00 AM'
+
+            tile = tk.Frame(self._dd_hourly_frame, bg=self.BG,
+                            highlightbackground=self.BORDER, highlightthickness=1)
+            tile.pack(side='left', padx=3, fill='both', expand=True)
+            tk.Label(tile, text=h_label, font=("Segoe UI", 8),
+                     bg=self.BG, fg=self.MUTED2).pack(pady=(6,1))
+            tk.Label(tile, text=ic, font=("Segoe UI", 18), bg=self.BG).pack()
+            tk.Label(tile, text=f"{self._c(temp)}°",
+                     font=("Segoe UI", 10, "bold"), bg=self.BG, fg=self.TEXT2).pack()
+            tk.Label(tile, text=f"💧{rain}%" if rain else "—",
+                     font=("Segoe UI", 8), bg=self.BG,
+                     fg=self.ACCENT2 if rain else self.MUTED2).pack(pady=(1,6))
+
+    # ─────────────────────────────────────────────────────────────
+    def _build_current_card(self, parent):
+        outer = tk.Frame(parent, bg=self.CARD,
+                         highlightbackground=self.BORDER, highlightthickness=1)
+        outer.pack(fill='x', padx=14, pady=(0,4))
+
+        outer.columnconfigure(0, weight=0)
+        outer.columnconfigure(1, weight=0)
+        outer.columnconfigure(2, weight=1)
+
+        # Left: icon + temp + condition
+        left = tk.Frame(outer, bg=self.CARD, padx=18, pady=14)
+        left.grid(row=0, column=0, sticky='nsew')
+
+        self.lbl_ts = tk.Label(left, text="Current weather",
+                               font=("Segoe UI", 9), bg=self.CARD, fg=self.MUTED2)
+        self.lbl_ts.pack(anchor='w')
+
+        icon_row = tk.Frame(left, bg=self.CARD)
+        icon_row.pack(anchor='w', pady=(6,0))
+        self.lbl_icon = tk.Label(icon_row, text="☀️", font=("Segoe UI", 48), bg=self.CARD)
+        self.lbl_icon.pack(side='left', padx=(0, 12))
+        temp_block = tk.Frame(icon_row, bg=self.CARD)
+        temp_block.pack(side='left')
+        self.lbl_temp   = tk.Label(temp_block, text="--°", font=("Segoe UI", 46, "bold"),
+                                   bg=self.CARD, fg=self.TEXT)
+        self.lbl_temp.pack(anchor='w')
+        self.lbl_cond   = tk.Label(temp_block, text="--", font=("Segoe UI", 13),
+                                   bg=self.CARD, fg=self.TEXT3)
+        self.lbl_cond.pack(anchor='w')
+        self.lbl_feels  = tk.Label(temp_block, text="Feels like --°", font=("Segoe UI", 10),
+                                   bg=self.CARD, fg=self.MUTED2)
+        self.lbl_feels.pack(anchor='w')
+
+        self.lbl_desc = tk.Label(left, text="", font=("Segoe UI", 10),
+                                 bg=self.CARD, fg=self.MUTED, wraplength=260, justify='left')
+        self.lbl_desc.pack(anchor='w', pady=(8,0))
+
+        meta = tk.Frame(left, bg=self.CARD)
+        meta.pack(anchor='w', pady=(6,0))
+        self.meta_wind = tk.Label(meta, text="💨 -- km/h", font=("Segoe UI", 9),
+                                  bg=self.CARD, fg=self.MUTED)
+        self.meta_wind.pack(side='left', padx=(0,10))
+        self.meta_hum  = tk.Label(meta, text="💧 --%", font=("Segoe UI", 9),
+                                  bg=self.CARD, fg=self.MUTED)
+        self.meta_hum.pack(side='left', padx=(0,10))
+        self.meta_vis  = tk.Label(meta, text="👁️ -- km", font=("Segoe UI", 9),
+                                  bg=self.CARD, fg=self.MUTED)
+        self.meta_vis.pack(side='left', padx=(0,10))
+        self.meta_pres = tk.Label(meta, text="🌡️ -- hPa", font=("Segoe UI", 9),
+                                  bg=self.CARD, fg=self.MUTED)
+        self.meta_pres.pack(side='left')
+
+        # Divider
+        div = tk.Frame(outer, bg=self.BORDER, width=1)
+        div.grid(row=0, column=1, sticky='ns', pady=12)
+
+        # Right: 8 detail tiles in 4×2 grid
+        right = tk.Frame(outer, bg=self.CARD, padx=12, pady=14)
+        right.grid(row=0, column=2, sticky='nsew')
+        self.detail_widgets = {}
+        tiles = [
+            ('💧', 'Humidity',   'humidity',   '%'),
+            ('💨', 'Wind',       'wind',       ' km/h'),
+            ('🌡️','Pressure',   'pressure',   ' hPa'),
+            ('👁️','Visibility', 'visibility', ' km'),
+            ('🔆', 'UV Index',   'uv',         ''),
+            ('🌅', 'Sunrise',    'sunrise',    ''),
+            ('🌇', 'Sunset',     'sunset',     ''),
+            ('🌧️','Rain',       'rain',       '%'),
+        ]
+        for col in range(4): right.columnconfigure(col, weight=1)
+        for i, (icon, label, key, unit) in enumerate(tiles):
+            row_n, col_n = divmod(i, 4)
+            tile = tk.Frame(right, bg=self.BG,
+                            highlightbackground=self.BORDER, highlightthickness=1)
+            tile.grid(row=row_n, column=col_n, padx=4, pady=4, sticky='nsew')
+            right.rowconfigure(row_n, weight=1)
+            tk.Label(tile, text=icon, font=("Segoe UI", 14), bg=self.BG).pack(pady=(8,1))
+            tk.Label(tile, text=label, font=("Segoe UI", 8),
+                     bg=self.BG, fg=self.MUTED2).pack()
+            self.detail_widgets[key] = tk.Label(tile, text=f"--{unit}",
+                                                font=("Segoe UI", 11, "bold"),
+                                                bg=self.BG, fg=self.TEXT2)
+            self.detail_widgets[key].pack(pady=(1,8))
+
+    # ─────────────────────────────────────────────────────────────
+    def _build_hourly_section(self, parent):
+        tk.Label(parent, text="🕐  Hourly Forecast",
+                 font=("Segoe UI", 11, "bold"), bg=self.BG, fg=self.TEXT3
+                 ).pack(fill='x', padx=14, pady=(10,4))
+
+        outer = tk.Frame(parent, bg=self.CARD,
+                         highlightbackground=self.BORDER, highlightthickness=1)
+        outer.pack(fill='x', padx=14, pady=(0,4))
+
+        # Tab bar
+        tab_bar = tk.Frame(outer, bg=self.CARD)
+        tab_bar.pack(fill='x', padx=10, pady=(8,0))
+        tk.Frame(outer, bg=self.BORDER, height=1).pack(fill='x')
+
+        self._hourly_tab_btns = {}
+        self._hourly_active_tab = tk.StringVar(value='Summary')
+        for name in ('Summary', 'Hourly', 'More details'):
+            btn = tk.Label(tab_bar, text=name, font=("Segoe UI", 10),
+                           bg=self.CARD, fg=self.ACCENT2 if name=='Summary' else self.MUTED2,
+                           padx=14, pady=6, cursor='hand2')
+            btn.pack(side='left')
+            btn.bind('<Button-1>', lambda e, n=name: self._hourly_select_tab(n))
+            self._hourly_tab_btns[name] = btn
+
+        # Canvas for the scrollable chart
+        cv_frame = tk.Frame(outer, bg=self.CARD)
+        cv_frame.pack(fill='x')
+
+        CHART_TOTAL_H = 215
+        self.hourly_cv = tk.Canvas(cv_frame, bg=self.CARD,
+                                   height=CHART_TOTAL_H, highlightthickness=0,
+                                   xscrollincrement=1)
+        self.hourly_cv.pack(fill='x', expand=True, padx=0)
+
+        # Real, visible horizontal scrollbar — same native canvas/scrollbar
+        # protocol as the main page, so this chart can also be dragged
+        # directly instead of relying solely on the wheel.
+        self._hourly_hbar = ttk.Scrollbar(outer, orient='horizontal',
+                                          style='Weather.Horizontal.TScrollbar',
+                                          command=self.hourly_cv.xview)
+        self._hourly_hbar.pack(fill='x', padx=10, pady=(2,8))
+        self.hourly_cv.configure(xscrollcommand=self._hourly_hbar.set)
+
+        # Wheel just nudges the same native scroll the scrollbar drives —
+        # no manual fraction math.
+        def _hourly_wheel(event):
+            self.hourly_cv.xview_scroll(int(-event.delta / 2), 'units')
+
+        self.hourly_cv.bind('<MouseWheel>',       _hourly_wheel)
+        self.hourly_cv.bind('<Shift-MouseWheel>',  _hourly_wheel)
+        self.hourly_cv.bind('<ButtonPress-1>',
+            lambda e: self.hourly_cv.scan_mark(e.x, e.y))
+        self.hourly_cv.bind('<B1-Motion>',
+            lambda e: self.hourly_cv.scan_dragto(e.x, e.y, gain=1))
+
+    def _hourly_select_tab(self, name):
+        self._hourly_active_tab.set(name)
+        for n, btn in self._hourly_tab_btns.items():
+            target = self.ACCENT2 if n == name else self.MUTED2
+            # Animate color change
+            current = btn.cget('fg')
+            self._animate_label_color(btn, current, target)
+
+    # ─────────────────────────────────────────────────────────────
+    def _render_hourly_chart(self, hourly, daily):
+        c = self.hourly_cv
+        c.delete('all')
+
+        # Layout constants
+        COL_W    = 68
+        PAD_L    = 20
+        PAD_T    = 30     # space above curve for temp labels
+        CHART_H  = 95     # height of the curve area
+        CHART_T  = PAD_T
+        CHART_B  = CHART_T + CHART_H
+        ICON_T   = CHART_B + 14
+        TIME_T   = ICON_T  + 34
+        RAIN_T   = TIME_T  + 22
+        TOTAL_H  = RAIN_T  + 24
+
+        all_times = hourly.get('time',   [])
+        all_temps = hourly.get('temperature_2m', [])
+        all_codes = hourly.get('weather_code', [])
+        all_rain  = hourly.get('precipitation_probability', [])
+
+        # Find starting index (first hour >= now)
+        now = datetime.now()
+        start = 0
+        for i, t_str in enumerate(all_times):
+            try:
+                dt = datetime.fromisoformat(t_str.replace('Z',''))
+                if dt >= now.replace(minute=0, second=0, microsecond=0):
+                    start = i; break
+            except Exception:
+                pass
+
+        # Pick every 2 hours for 30 hours = 15 visible slots + 1 extra for curve tail
+        N_SLOTS = 16
+        STEP    = 2
+        indices = [start + j*STEP for j in range(N_SLOTS)
+                   if start + j*STEP < len(all_times)]
+        n = len(indices)
+        if n < 3:
+            return
+
+        TOTAL_W = PAD_L + n * COL_W + PAD_L
+        c.configure(scrollregion=(0, 0, TOTAL_W, TOTAL_H), height=TOTAL_H)
+
+        # Temperature values
+        temps = []
+        for idx in indices:
+            try:    temps.append(float(all_temps[idx]))
+            except: temps.append(0.0)
+        mn   = min(temps) - 2.5
+        mx   = max(temps) + 3.5
+        span = max(mx - mn, 1)
+
+        def xof(i): return PAD_L + COL_W//2 + i * COL_W
+        def yof(t): return CHART_T + int((1 - (t - mn) / span) * CHART_H)
+
+        raw_pts = [(xof(i), yof(temps[i])) for i in range(n)]
+
+        # Catmull-Rom smooth curve points
+        def cr(pts):
+            out = []
+            m = len(pts)
+            for i in range(m - 1):
+                p0 = pts[max(i-1, 0)]
+                p1 = pts[i]
+                p2 = pts[i+1]
+                p3 = pts[min(i+2, m-1)]
+                for k in range(18):
+                    t  = k / 18
+                    t2, t3 = t*t, t*t*t
+                    x = .5*(2*p1[0]+(-p0[0]+p2[0])*t+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t3)
+                    y = .5*(2*p1[1]+(-p0[1]+p2[1])*t+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t3)
+                    out.append((x, y))
+            out.append(pts[-1])
+            return out
+
+        smooth = cr(raw_pts)
+
+        # ── Gradient fill (3 layers from bottom) ─────────────────
+        for fill_col, y_extra in [('#0c1f38',14),('#102540',8),('#142d4c',2)]:
+            poly = ([(smooth[0][0], CHART_B + y_extra)] +
+                    smooth +
+                    [(smooth[-1][0], CHART_B + y_extra)])
+            c.create_polygon(poly, fill=fill_col, outline='')
+
+        # ── Sunrise / Sunset dashed markers ──────────────────────
+        def draw_time_marker(iso_str, label, color):
+            try:
+                dt_m = datetime.fromisoformat(iso_str.replace('Z',''))
+                # Find fractional position on x-axis
+                # Map between indices[0] and indices[-1] time
+                t0 = datetime.fromisoformat(all_times[indices[0]].replace('Z',''))
+                t1 = datetime.fromisoformat(all_times[indices[-1]].replace('Z',''))
+                span_s = (t1 - t0).total_seconds()
+                if span_s <= 0: return
+                pos = (dt_m - t0).total_seconds() / span_s
+                if not (0 <= pos <= 1): return
+                x_m = PAD_L + COL_W//2 + pos * (n - 1) * COL_W
+                # Dashed line
+                y = CHART_T - 10
+                for seg in range(0, CHART_H + 10, 8):
+                    c.create_line(x_m, y+seg, x_m, min(y+seg+4, CHART_B),
+                                  fill=color, width=1)
+                # Label
+                time_str = dt_m.strftime('%I:%M').lstrip('0')
+                c.create_text(x_m, CHART_T - 16, text=label + ' ' + time_str,
+                              font=("Segoe UI", 8, "bold"), fill=color)
+            except Exception:
+                pass
+
+        if daily.get('sunrise') and daily['sunrise'][0]:
+            draw_time_marker(daily['sunrise'][0], '🌅', '#f5c842')
+        if daily.get('sunset') and daily['sunset'][0]:
+            draw_time_marker(daily['sunset'][0], '🌇', '#f5a030')
+
+        # ── Curve line ────────────────────────────────────────────
+        flat = [v for pt in smooth for v in pt]
+        if len(flat) >= 4:
+            c.create_line(flat, fill='#4a9be0', width=2, smooth=False)
+
+        # ── Per-slot: dot, temp, icon, time, rain ─────────────────
+        for i, idx in enumerate(indices[:-1]):   # skip last tail point
+            x = xof(i)
+
+            # Dot
+            y = raw_pts[i][1]
+            c.create_oval(x-4, y-4, x+4, y+4,
+                          fill='#5bc5e8', outline='#0a1628', width=2)
+            # Temp label
+            c.create_text(x, y - 15,
+                          text=f"{self._c(temps[i])}°",
+                          font=("Segoe UI", 9, "bold"), fill='#c8daf5')
+
+            # Weather icon
+            code = all_codes[idx] if idx < len(all_codes) else 0
+            icon, _ = self._wx(code)
+            c.create_text(x, ICON_T + 16, text=icon, font=("Segoe UI", 16))
+
+            # Time label
+            if i == 0:
+                # "Now" pill
+                c.create_rectangle(x-18, TIME_T, x+18, TIME_T+19,
+                                   fill='#1e3860', outline='#3a7bd5')
+                c.create_text(x, TIME_T+9, text='Now',
+                              font=("Segoe UI", 8, "bold"), fill='#5bc5e8')
+            else:
+                try:
+                    dt_h = datetime.fromisoformat(all_times[idx].replace('Z',''))
+                    h = dt_h.hour
+                    lbl = f"{'12' if h%12==0 else h%12} {'AM' if h<12 else 'PM'}"
+                except Exception:
+                    lbl = f"+{i*2}h"
+                c.create_text(x, TIME_T+9, text=lbl,
+                              font=("Segoe UI", 9), fill='#4a7aab')
+
+            # Rain %
+            rain = all_rain[idx] if idx < len(all_rain) else 0
+            if rain:
+                c.create_text(x, RAIN_T+10,
+                              text=f"💧{rain}%",
+                              font=("Segoe UI", 8), fill='#3a7abf')
+            else:
+                c.create_text(x, RAIN_T+10, text="—",
+                              font=("Segoe UI", 8), fill='#2a3a50')
+
+    # ─────────────────────────────────────────────────────────────
+    def _build_table(self, parent):
+        table_frame = tk.Frame(parent, bg=self.CARD,
+                               highlightbackground=self.BORDER, highlightthickness=1)
+        table_frame.pack(fill='x', padx=14, pady=(0,4))
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('W.Treeview',
+                        background=self.CARD,
+                        foreground=self.TEXT3,
+                        font=("Segoe UI", 10),
+                        rowheight=26,
+                        fieldbackground=self.CARD,
+                        borderwidth=0)
+        style.configure('W.Treeview.Heading',
+                        background=self.CARD2,
+                        foreground=self.MUTED,
+                        font=("Segoe UI", 9, "bold"),
+                        relief='flat')
+        style.map('W.Treeview', background=[('selected', '#1e3860')])
+
+        cols = ('Date','Day','Weather','High','Low','Rain')
+        self.tree = ttk.Treeview(table_frame, columns=cols,
+                                 show='headings', style="W.Treeview", height=30)
+        widths = {'Date':140,'Day':120,'Weather':180,'High':80,'Low':80,'Rain':90}
+        for c in cols:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=widths[c], anchor='center', stretch=True)
+        self.tree.tag_configure('today',    background='#162d50', foreground=self.TEXT2)
+        self.tree.tag_configure('odd',      background='#0e1c30')
+        self.tree.tag_configure('ensemble', background='#0a1e35', foreground='#5a7aab')
+
+        self.tree.grid(row=0, column=0, sticky='nsew')
+
+    # ─────────────────────────────────────────────────────────────
+    def _sb_sep(self):
+        tk.Frame(self.sidebar, bg=self.BORDER, height=1).pack(
+            fill='x', padx=10, pady=8)
+
+    def _sb_label(self, text):
+        tk.Label(self.sidebar, text=text, font=("Segoe UI", 8, "bold"),
+                 bg=self.BG, fg=self.MUTED2).pack(anchor='w', padx=12, pady=(4,6))
+
+    def _build_sidebar_widgets(self):
+        sb = self.sidebar
+
+        # ── Sun / Moon ────────────────────────────────────────────
+        self._sb_label("SUN / MOON")
+        sec1 = tk.Frame(sb, bg=self.BG, padx=10)
+        sec1.pack(fill='x', pady=(0,4))
+
+        sun_row = tk.Frame(sec1, bg=self.BG)
+        sun_row.pack(fill='x')
+        sun_row.columnconfigure(1, weight=1)
+
+        sr_blk = tk.Frame(sun_row, bg=self.BG)
+        sr_blk.grid(row=0, column=0, sticky='w')
+        tk.Label(sr_blk, text="🌅", font=("Segoe UI", 18), bg=self.BG).pack()
+        tk.Label(sr_blk, text="Sunrise", font=("Segoe UI", 8),
+                 bg=self.BG, fg=self.MUTED2).pack()
+        self.sb_sr = tk.Label(sr_blk, text="--", font=("Segoe UI", 10, "bold"),
+                              bg=self.BG, fg=self.TEXT2)
+        self.sb_sr.pack()
+
+        mid_blk = tk.Frame(sun_row, bg=self.BG)
+        mid_blk.grid(row=0, column=1, padx=4)
+        self.sb_bar_canvas = tk.Canvas(mid_blk, bg=self.BG, height=6,
+                                       width=90, highlightthickness=0)
+        self.sb_bar_canvas.pack()
+        self.sb_dur = tk.Label(mid_blk, text="-- h daylight", font=("Segoe UI", 8),
+                               bg=self.BG, fg=self.ACCENT)
+        self.sb_dur.pack(pady=(4,0))
+
+        ss_blk = tk.Frame(sun_row, bg=self.BG)
+        ss_blk.grid(row=0, column=2, sticky='e')
+        tk.Label(ss_blk, text="🌇", font=("Segoe UI", 18), bg=self.BG).pack()
+        tk.Label(ss_blk, text="Sunset", font=("Segoe UI", 8),
+                 bg=self.BG, fg=self.MUTED2).pack()
+        self.sb_ss = tk.Label(ss_blk, text="--", font=("Segoe UI", 10, "bold"),
+                              bg=self.BG, fg=self.TEXT2)
+        self.sb_ss.pack()
+
+        moon_row = tk.Frame(sec1, bg=self.BG)
+        moon_row.pack(fill='x', pady=(10,0))
+        moon_row.columnconfigure(0, weight=1)
+        moon_row.columnconfigure(1, weight=1)
+
+        mr_blk = tk.Frame(moon_row, bg=self.BG)
+        mr_blk.grid(row=0, column=0, sticky='w')
+        tk.Label(mr_blk, text="🌙", font=("Segoe UI", 16), bg=self.BG).pack(side='left', padx=(0,5))
+        mr_txt = tk.Frame(mr_blk, bg=self.BG)
+        mr_txt.pack(side='left')
+        tk.Label(mr_txt, text="Moonrise", font=("Segoe UI", 8),
+                 bg=self.BG, fg=self.MUTED2).pack(anchor='w')
+        self.sb_mr = tk.Label(mr_txt, text="~9:20 PM", font=("Segoe UI", 10, "bold"),
+                              bg=self.BG, fg=self.TEXT2)
+        self.sb_mr.pack(anchor='w')
+
+        ms_blk = tk.Frame(moon_row, bg=self.BG)
+        ms_blk.grid(row=0, column=1, sticky='e')
+        tk.Label(ms_blk, text="🌑", font=("Segoe UI", 16), bg=self.BG).pack(side='left', padx=(0,5))
+        ms_txt = tk.Frame(ms_blk, bg=self.BG)
+        ms_txt.pack(side='left')
+        tk.Label(ms_txt, text="Moonset", font=("Segoe UI", 8),
+                 bg=self.BG, fg=self.MUTED2).pack(anchor='w')
+        self.sb_ms = tk.Label(ms_txt, text="~10:15 AM", font=("Segoe UI", 10, "bold"),
+                              bg=self.BG, fg=self.TEXT2)
+        self.sb_ms.pack(anchor='w')
+
+        self._sb_sep()
+
+        # ── Suggestions ───────────────────────────────────────────
+        self._sb_label("SUGGESTIONS")
+        self.sugg_frame = tk.Frame(sb, bg=self.BG, padx=10)
+        self.sugg_frame.pack(fill='x', pady=(0,4))
+
+        self._sb_sep()
+
+        # ── Wind Details ──────────────────────────────────────────
+        self._sb_label("WIND DETAILS")
+        wind_sec = tk.Frame(sb, bg=self.BG, padx=10)
+        wind_sec.pack(fill='x', pady=(0,4))
+
+        wind_inner = tk.Frame(wind_sec, bg=self.CARD,
+                              highlightbackground=self.BORDER, highlightthickness=1)
+        wind_inner.pack(fill='x')
+        wind_inner.columnconfigure(0, weight=1)
+        wind_inner.columnconfigure(1, weight=1)
+
+        # Compass canvas
+        compass_col = tk.Frame(wind_inner, bg=self.CARD, padx=6, pady=8)
+        compass_col.grid(row=0, column=0, sticky='nsew')
+        self.compass_cv = tk.Canvas(compass_col, width=68, height=68,
+                                    bg=self.CARD, highlightthickness=0)
+        self.compass_cv.pack()
+        self.sb_wind_dir_lbl = tk.Label(compass_col, text="--°", font=("Segoe UI", 8),
+                                        bg=self.CARD, fg=self.MUTED2)
+        self.sb_wind_dir_lbl.pack()
+
+        # Wind stats
+        stats_col = tk.Frame(wind_inner, bg=self.CARD, padx=6, pady=8)
+        stats_col.grid(row=0, column=1, sticky='nsew')
+        tk.Label(stats_col, text="Speed", font=("Segoe UI", 8),
+                 bg=self.CARD, fg=self.MUTED2).pack(anchor='w')
+        self.sb_wind_speed = tk.Label(stats_col, text="-- km/h",
+                                      font=("Segoe UI", 12, "bold"),
+                                      bg=self.CARD, fg=self.TEXT2)
+        self.sb_wind_speed.pack(anchor='w')
+        tk.Label(stats_col, text="Max Gust", font=("Segoe UI", 8),
+                 bg=self.CARD, fg=self.MUTED2).pack(anchor='w', pady=(8,0))
+        self.sb_wind_gust = tk.Label(stats_col, text="-- km/h",
+                                     font=("Segoe UI", 11, "bold"),
+                                     bg=self.CARD, fg=self.WARN)
+        self.sb_wind_gust.pack(anchor='w')
+        tk.Label(stats_col, text="Max Today", font=("Segoe UI", 8),
+                 bg=self.CARD, fg=self.MUTED2).pack(anchor='w', pady=(8,0))
+        self.sb_wind_max = tk.Label(stats_col, text="-- km/h",
+                                    font=("Segoe UI", 11, "bold"),
+                                    bg=self.CARD, fg=self.TEXT3)
+        self.sb_wind_max.pack(anchor='w')
+
+        self._sb_sep()
+
+        # ── Humidity & Comfort ────────────────────────────────────
+        self._sb_label("HUMIDITY & COMFORT")
+        hum_sec = tk.Frame(sb, bg=self.BG, padx=10)
+        hum_sec.pack(fill='x', pady=(0,4))
+
+        hum_card = tk.Frame(hum_sec, bg=self.CARD,
+                            highlightbackground=self.BORDER, highlightthickness=1,
+                            padx=10, pady=10)
+        hum_card.pack(fill='x')
+
+        # Humidity bar
+        hum_top = tk.Frame(hum_card, bg=self.CARD)
+        hum_top.pack(fill='x')
+        tk.Label(hum_top, text="💧 Humidity", font=("Segoe UI", 9),
+                 bg=self.CARD, fg=self.MUTED2).pack(side='left')
+        self.sb_hum_pct = tk.Label(hum_top, text="--%",
+                                   font=("Segoe UI", 9, "bold"),
+                                   bg=self.CARD, fg=self.ACCENT2)
+        self.sb_hum_pct.pack(side='right')
+        self.sb_hum_bar = tk.Canvas(hum_card, height=5, bg=self.BORDER,
+                                    highlightthickness=0)
+        self.sb_hum_bar.pack(fill='x', pady=(4,8))
+
+        rows_hum = [
+            ("Dew Point",    'sb_dewpoint'),
+            ("Cloud Cover",  'sb_cloud'),
+            ("Comfort",      'sb_comfort'),
+        ]
+        for label, attr in rows_hum:
+            r = tk.Frame(hum_card, bg=self.CARD)
+            r.pack(fill='x', pady=2)
+            tk.Label(r, text=label, font=("Segoe UI", 9),
+                     bg=self.CARD, fg=self.MUTED2).pack(side='left')
+            lbl = tk.Label(r, text="--", font=("Segoe UI", 9, "bold"),
+                           bg=self.CARD, fg=self.TEXT2)
+            lbl.pack(side='right')
+            setattr(self, attr, lbl)
+
+        self._sb_sep()
+
+        # ── This Week ─────────────────────────────────────────────
+        self._sb_label("THIS WEEK")
+        week_sec = tk.Frame(sb, bg=self.BG, padx=10)
+        week_sec.pack(fill='x', pady=(0,4))
+
+        week_card = tk.Frame(week_sec, bg=self.CARD,
+                             highlightbackground=self.BORDER, highlightthickness=1,
+                             padx=8, pady=8)
+        week_card.pack(fill='x')
+        self.week_rows_frame = tk.Frame(week_card, bg=self.CARD)
+        self.week_rows_frame.pack(fill='x')
+
+        self._sb_sep()
+
+        # ── Health & Activity ─────────────────────────────────────
+        self._sb_label("HEALTH & ACTIVITY")
+        health_sec = tk.Frame(sb, bg=self.BG, padx=10)
+        health_sec.pack(fill='x', pady=(0,12))
+
+        health_card = tk.Frame(health_sec, bg=self.CARD,
+                               highlightbackground=self.BORDER, highlightthickness=1,
+                               padx=10, pady=10)
+        health_card.pack(fill='x')
+
+        health_items = [
+            ("🧴", "UV Protection",   'sb_uv_advice'),
+            ("🏃", "Exercise",        'sb_exercise'),
+            ("😷", "Air Quality",     'sb_air'),
+            ("👕", "Wind Chill",      'sb_windchill'),
+            ("☔", "Rain Risk",       'sb_rain_risk'),
+        ]
+        for icon_h, label_h, attr_h in health_items:
+            r = tk.Frame(health_card, bg=self.CARD)
+            r.pack(fill='x', pady=3)
+            tk.Label(r, text=icon_h, font=("Segoe UI", 12),
+                     bg=self.CARD).pack(side='left', padx=(0,6))
+            info = tk.Frame(r, bg=self.CARD)
+            info.pack(side='left', fill='x', expand=True)
+            tk.Label(info, text=label_h, font=("Segoe UI", 8),
+                     bg=self.CARD, fg=self.MUTED2).pack(anchor='w')
+            lbl = tk.Label(info, text="--", font=("Segoe UI", 9, "bold"),
+                           bg=self.CARD, fg=self.TEXT2)
+            lbl.pack(anchor='w')
+            setattr(self, attr_h, lbl)
+
+    # ══════════════════════════════════════════════════════════════
+    # DATA FETCHING
+    # ══════════════════════════════════════════════════════════════
+    def _do_search(self, city=None):
+        if city is None:
+            city = self.search_var.get().strip()
+            if city == "Search city...":
+                city = ""
+        if not city:
+            return
+        self.last_city = city
+        self._show('loading')
+        threading.Thread(target=self._fetch, args=(city,), daemon=True).start()
+
+    def _do_location(self):
+        self._show('loading')
+        threading.Thread(target=self._fetch_location, daemon=True).start()
+
+    def _fetch(self, city):
+        try:
+            geo = self._get(
+                f"https://nominatim.openstreetmap.org/search?format=json&q={city}&limit=1",
+                headers={'User-Agent': 'MasrurWeather/2.0'}
+            )
+            if not geo:
+                raise Exception("City not found")
+            lat, lon = float(geo[0]['lat']), float(geo[0]['lon'])
+            self.last_country = geo[0]['display_name'].split(',')[-1].strip()
+
+            # ── Phase 1: show standard 16-day immediately ─────────
+            std_data = self._get(self._weather_url(lat, lon))
+            if not std_data:
+                raise Exception("Weather data unavailable")
+            self.weather_data = std_data
+            self.root.after(0, lambda: self._render(city, self.last_country))
+            self.root.after(0, lambda: self._save_city(city))
+
+            # ── Phase 2: silently extend to 35 days in background ─
+            threading.Thread(
+                target=self._extend_forecast,
+                args=(lat, lon, city, self.last_country, std_data),
+                daemon=True
+            ).start()
+
+        except Exception as e:
+            msg = str(e) or "City not found"
+            self.root.after(0, lambda m=msg: self._show_error(m))
+
+    def _extend_forecast(self, lat, lon, city, country, std_data):
+        """Background thread: fetch GFS ensemble and update table if it arrives."""
+        try:
+            ens_data = self._get(self._ensemble_url(lat, lon),
+                                 timeout=8, max_retries=1)
+            if not ens_data:
+                return
+            merged = self._merge_forecasts(std_data, ens_data)
+            self.weather_data = merged
+            # Only refresh the table + insights, not the whole screen
+            self.root.after(0, lambda d=merged.get('daily',{}):
+                            self._refresh_extended(d))
+        except Exception:
+            pass  # Ensemble unavailable — 16-day stays, no error shown
+
+    def _fetch_location(self):
+        try:
+            import json, urllib.request
+            ip = json.loads(urllib.request.urlopen("http://ip-api.com/json/", timeout=8).read())
+            if ip.get('status') != 'success':
+                raise Exception("Location unavailable")
+            lat, lon = ip['lat'], ip['lon']
+
+            std_data = self._get(self._weather_url(lat, lon))
+            if not std_data:
+                raise Exception("Weather data unavailable")
+            self.weather_data = std_data
+            city    = ip.get('city', 'Your Location')
+            country = ip.get('country', '')
+            self.last_city, self.last_country = city, country
+            self.root.after(0, lambda: self._render(city, country))
+
+            threading.Thread(
+                target=self._extend_forecast,
+                args=(lat, lon, city, country, std_data),
+                daemon=True
+            ).start()
+        except Exception:
+            self.root.after(0, lambda: self._show_error("Could not detect location"))
+
+    def _weather_url(self, lat, lon):
+        return (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
+            f"weather_code,wind_speed_10m,wind_direction_10m,surface_pressure"
+            f"&hourly=temperature_2m,weather_code,precipitation_probability,"
+            f"visibility,dew_point_2m,cloud_cover"
+            f"&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+            f"precipitation_probability_max,sunrise,sunset,uv_index_max,"
+            f"wind_speed_10m_max,wind_gusts_10m_max"
+            f"&forecast_days=16&timezone=auto"
+        )
+
+    def _ensemble_url(self, lat, lon):
+        # GFS ensemble — free, no API key, up to 35 days
+        return (
+            f"https://ensemble-api.open-meteo.com/v1/ensemble"
+            f"?latitude={lat}&longitude={lon}"
+            f"&daily=temperature_2m_max,temperature_2m_min,"
+            f"precipitation_sum,weather_code,wind_speed_10m_max"
+            f"&models=gfs_seamless&forecast_days=30&timezone=auto"
+        )
+
+    def _merge_forecasts(self, std, ens):
+        """Merge 16-day precise forecast with GFS ensemble mean for days 17-35."""
+        if not std:
+            return std or {}
+        if not ens:
+            return std
+
+        daily     = std.get('daily', {})
+        std_times = set(daily.get('time', []))
+        ens_daily = ens.get('daily', {})
+        ens_times = ens_daily.get('time', [])
+
+        # Days present in ensemble but NOT yet in standard forecast
+        new_times = [t for t in ens_times if t not in std_times]
+        if not new_times:
+            return std
+
+        new_indices = [i for i, t in enumerate(ens_times) if t in set(new_times)]
+
+        def ens_mean(var):
+            """Average all member columns for `var` at `new_indices`."""
+            member_cols = {k: v for k, v in ens_daily.items()
+                           if k.startswith(var + '_member') and isinstance(v, list)}
+            if not member_cols:
+                # Some builds return non-suffixed arrays (list-of-lists); handle gracefully
+                raw = ens_daily.get(var)
+                if isinstance(raw, list) and raw and isinstance(raw[0], list):
+                    member_cols = {f'm{j}': raw[j] for j in range(len(raw))}
+            result = []
+            for idx in new_indices:
+                vals = [col[idx] for col in member_cols.values()
+                        if col and idx < len(col) and col[idx] is not None]
+                result.append(round(sum(vals) / len(vals), 1) if vals else None)
+            return result
+
+        def ens_mode(var):
+            """Most common weather_code across members at each new index."""
+            from collections import Counter
+            member_cols = {k: v for k, v in ens_daily.items()
+                           if k.startswith(var + '_member') and isinstance(v, list)}
+            result = []
+            for idx in new_indices:
+                vals = [col[idx] for col in member_cols.values()
+                        if col and idx < len(col) and col[idx] is not None]
+                result.append(Counter(vals).most_common(1)[0][0] if vals else 0)
+            return result
+
+        def ens_prob(var):
+            """Fraction of members with precipitation_sum > 0.1 mm → percent."""
+            member_cols = {k: v for k, v in ens_daily.items()
+                           if k.startswith(var + '_member') and isinstance(v, list)}
+            result = []
+            for idx in new_indices:
+                vals = [col[idx] for col in member_cols.values()
+                        if col and idx < len(col) and col[idx] is not None]
+                result.append(round(100 * sum(1 for v in vals if v > 0.1) / len(vals))
+                              if vals else 0)
+            return result
+
+        n_new = len(new_times)
+
+        # Extend each daily variable
+        for var, fn in [('temperature_2m_max', ens_mean),
+                        ('temperature_2m_min',  ens_mean),
+                        ('wind_speed_10m_max',  ens_mean),
+                        ('weather_code',        ens_mode)]:
+            if var in daily:
+                daily[var] = list(daily[var]) + fn(var)
+
+        # Precipitation probability derived from ensemble spread
+        prob_ext = ens_prob('precipitation_sum')
+        if 'precipitation_probability_max' in daily:
+            daily['precipitation_probability_max'] = (
+                list(daily['precipitation_probability_max']) + prob_ext)
+
+        # Extend sunrise/sunset by repeating the last known value
+        for key in ('sunrise', 'sunset', 'uv_index_max',
+                    'wind_gusts_10m_max'):
+            if daily.get(key):
+                last = daily[key][-1]
+                daily[key] = list(daily[key]) + [last] * n_new
+
+        daily['time'] = list(daily['time']) + new_times
+        std['daily']  = daily
+        return std
+
+    def _get(self, url, headers=None, timeout=10, max_retries=3):
+        import urllib.request, urllib.error, json, time, ssl
+        hdrs = {'User-Agent': 'MasrurWeather/2.0', 'Accept': 'application/json'}
+        if headers:
+            hdrs.update(headers)
+        # Try without SSL verification as fallback for systems with cert issues
+        ctx_normal  = ssl.create_default_context()
+        ctx_noverify = ssl.create_default_context()
+        ctx_noverify.check_hostname = False
+        ctx_noverify.verify_mode    = ssl.CERT_NONE
+        last_err = None
+        for attempt in range(max_retries):
+            for ctx in (ctx_normal, ctx_noverify):
+                try:
+                    req = urllib.request.Request(url, headers=hdrs)
+                    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                        return json.loads(resp.read().decode('utf-8'))
+                except urllib.error.HTTPError as e:
+                    body = ''
+                    try: body = e.read().decode('utf-8', errors='ignore')[:200]
+                    except Exception: pass
+                    if e.code == 429:
+                        time.sleep((attempt + 1) * 2)
+                        last_err = f"Rate limited (429)"
+                        break   # retry outer loop
+                    # Expose status + reason (strip URL)
+                    reason = body if body else e.reason
+                    raise Exception(f"HTTP {e.code}: {reason[:100]}")
+                except urllib.error.URLError as e:
+                    last_err = f"URL error: {e.reason}"
+                    break   # retry with next attempt
+                except OSError as e:
+                    last_err = str(e)
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    break
+            if last_err and attempt < max_retries - 1:
+                time.sleep(1)
+        raise Exception(last_err or "Network request failed")
+
+    def _refresh_extended(self, daily):
+        """Called on the main thread after ensemble data arrives — update table + insights only.
+
+        This fires several seconds AFTER the initial render, completely
+        independently of it — typically while the user is already
+        scrolling the page. It swaps the table from 16 to 30 rows and
+        rebuilds every insight card, which changes self.center's height
+        out from under an in-progress scroll. Without the same lock/sync
+        treatment as _render(), this is the main reproducible trigger for
+        the duplicated/overlapping sections seen mid-scroll.
+        """
+        self._render_lock = True
+        try:
+            self._render_table(daily)
+            self._render_insights(daily)
+        except Exception:
+            pass
+        finally:
+            def _settle():
+                self._sync_scrollregion(self._main_cv)
+                self._render_lock = False
+            self.root.after(100, _settle)
+
+    def _show_error(self, msg):
+        msg = str(msg)
+        if 'City not found' in msg or 'city not found' in msg.lower():
+            display = "City not found. Please check the spelling and try again."
+        elif 'timeout' in msg.lower() or 'timed out' in msg.lower():
+            display = "Connection timed out. Please check your internet and try again."
+        elif 'connection' in msg.lower() or 'network' in msg.lower():
+            display = "No internet connection. Please check your network settings."
+        elif 'Weather data unavailable' in msg:
+            display = "Weather data unavailable. Please try again."
+        else:
+            display = "Could not load weather data. Please try again."
+        # Strip URL from technical detail but keep the error code/reason
+        detail = msg
+        if 'for url:' in detail:
+            detail = detail.split('for url:')[0].strip()
+        if len(detail) > 120:
+            detail = detail[:120] + '…'
+        self.error_msg.config(text=display)
+        self.error_detail.config(text=detail if detail != display else '')
+        self._show('error')
+
+    # ══════════════════════════════════════════════════════════════
+    # RENDER
+    # ══════════════════════════════════════════════════════════════
+    def _render(self, city, country):
+        # Block scrolling for the duration of the rebuild — see
+        # _sync_scrollregion for why scrolling mid-rebuild caused
+        # sections to visually overlap/duplicate.
+        self._render_lock = True
+        d     = self.weather_data
+        cur   = d.get('current', {})
+        daily = d.get('daily',   {})
+
+        icon, cond = self._wx(cur.get('weather_code', 0))
+
+        # Topbar tab
+        self.tab_city.config(text=city)
+        self.tab_temp.config(text=f"  {self._c(cur.get('temperature_2m', 0))}°")
+
+        # City header
+        self.lbl_city.config(text=city)
+        self.lbl_country.config(text=country)
+
+        # Current
+        self.lbl_ts.config(
+            text=f"Current weather · {datetime.now().strftime('%I:%M %p')}")
+        self.lbl_icon.config(text=icon)
+        self.lbl_temp.config(text=f"{self._c(cur.get('temperature_2m', 0))}°")
+        self.lbl_cond.config(text=cond)
+        self.lbl_feels.config(
+            text=f"Feels like {self._c(cur.get('apparent_temperature', 0))}°")
+
+        desc_key = min(self._WX_DESC.keys(),
+                       key=lambda k: abs(k - cur.get('weather_code', 0)))
+        self.lbl_desc.config(text=self._WX_DESC.get(cur.get('weather_code', 0),
+                             self._WX_DESC[desc_key]))
+
+        wind = round(cur.get('wind_speed_10m', 0))
+        hum  = round(cur.get('relative_humidity_2m', 0))
+        # visibility comes from hourly (not in current params)
+        hourly_now = self.weather_data.get('hourly', {})
+        h_vis_list = hourly_now.get('visibility', [])
+        vis_raw    = h_vis_list[0] if h_vis_list else 0
+        vis  = (vis_raw or 0) / 1000
+        pres = round(cur.get('surface_pressure', 0))
+
+        self.meta_wind.config(text=f"💨 {wind} km/h")
+        self.meta_hum.config( text=f"💧 {hum}%")
+        self.meta_vis.config( text=f"👁️ {vis:.1f} km")
+        self.meta_pres.config(text=f"🌡️ {pres} hPa")
+
+        self.detail_widgets['humidity'].config(text=f"{hum}%")
+        self.detail_widgets['wind'].config(    text=f"{wind} km/h")
+        self.detail_widgets['pressure'].config(text=f"{pres} hPa")
+        self.detail_widgets['visibility'].config(text=f"{vis:.1f} km")
+
+        uv = (daily.get('uv_index_max') or [None])[0]
+        uv_txt = f"{round(uv,1)}" if uv is not None else '--'
+        self.detail_widgets['uv'].config(text=uv_txt,
+            fg=self.WARN if (uv or 0) >= 6 else self.ACCENT2)
+
+        rain0 = (daily.get('precipitation_probability_max') or [0])[0]
+        self.detail_widgets['rain'].config(text=f"{rain0}%",
+            fg=self.ACCENT2 if rain0 < 50 else self.WARN)
+
+        for key, lst in (('sunrise', daily.get('sunrise',[])),
+                         ('sunset',  daily.get('sunset', []))):
+            val = '--'
+            if lst:
+                try: val = datetime.fromisoformat(lst[0].replace('Z','+00:00')).strftime('%I:%M %p')
+                except: pass
+            self.detail_widgets[key].config(text=val)
+
+        # Sun/Moon sidebar
+        sr_str = ss_str = '--'
+        if daily.get('sunrise'):
+            try: sr_str = datetime.fromisoformat(
+                    daily['sunrise'][0].replace('Z','+00:00')).strftime('%I:%M %p')
+            except: pass
+        if daily.get('sunset'):
+            try: ss_str = datetime.fromisoformat(
+                    daily['sunset'][0].replace('Z','+00:00')).strftime('%I:%M %p')
+            except: pass
+        self.sb_sr.config(text=sr_str)
+        self.sb_ss.config(text=ss_str)
+
+        # Daylight progress bar
+        try:
+            sr_dt = datetime.fromisoformat(daily['sunrise'][0].replace('Z','+00:00'))
+            ss_dt = datetime.fromisoformat(daily['sunset'][0].replace('Z','+00:00'))
+            now_dt = datetime.now(sr_dt.tzinfo) if sr_dt.tzinfo else datetime.now()
+            total = (ss_dt - sr_dt).seconds
+            elapsed = max(0, (now_dt.replace(tzinfo=None) - sr_dt.replace(tzinfo=None)).seconds)
+            pct = min(1.0, elapsed / total) if total else 0.5
+            hrs = round(total / 3600)
+            c = self.sb_bar_canvas
+            c.delete('all')
+            c.create_rectangle(0, 0, 100, 6, fill=self.BORDER, outline='')
+            c.create_rectangle(0, 0, int(100*pct), 6, fill=self.ACCENT, outline='')
+            self.sb_dur.config(text=f"{hrs}h daylight")
+        except:
+            pass
+
+        # Suggestions
+        for w in self.sugg_frame.winfo_children():
+            w.destroy()
+        suggs = [
+            ('☂️', 'Umbrella',  'Bring one' if rain0 > 50 else 'No need'),
+            ('👒', 'Clothing',  'Light summer' if self._c(cur.get('temperature_2m',28)) > 28 else 'Light jacket'),
+            ('🌿', 'Outdoors',  'Not ideal' if rain0 > 70 else 'Take caution' if rain0 > 40 else 'Good to go'),
+        ]
+        for icon_s, title, sub in suggs:
+            row = tk.Frame(self.sugg_frame, bg=self.CARD,
+                           highlightbackground=self.BORDER, highlightthickness=1)
+            row.pack(fill='x', pady=3)
+            tk.Label(row, text=icon_s, font=("Segoe UI", 16),
+                     bg=self.CARD, padx=10, pady=8).pack(side='left')
+            txt = tk.Frame(row, bg=self.CARD)
+            txt.pack(side='left')
+            tk.Label(txt, text=title, font=("Segoe UI", 10, "bold"),
+                     bg=self.CARD, fg=self.TEXT2).pack(anchor='w')
+            tk.Label(txt, text=sub, font=("Segoe UI", 9),
+                     bg=self.CARD, fg=self.MUTED).pack(anchor='w')
+
+        # 7-day forecast
+        self._render_forecast(daily)
+
+        # Hourly chart
+        self._render_hourly_chart(self.weather_data.get('hourly', {}), daily)
+
+        # 15-day table
+        self._render_table(daily)
+
+        # Insights
+        self._render_insights(daily)
+
+        # Extra sidebar sections
+        self._render_sidebar_extra(cur, daily)
+
+        self._show('main')
+
+        # Re-attach hover routing after dynamic widgets are created
+        def _reattach():
+            def _bind_enter(widget, cv):
+                try:
+                    widget.bind('<Enter>',
+                        lambda e, c=cv: setattr(self, '_scroll_target', c), add='+')
+                    for child in widget.winfo_children():
+                        _bind_enter(child, cv)
+                except Exception:
+                    pass
+            _bind_enter(self.center,  self._main_cv)
+            _bind_enter(self.sidebar, self._sb_cv)
+
+            # Recompute scrollregion only after Tk has fully settled the
+            # batch of widget destroy/recreate calls above, then snap the
+            # view back to the top of the freshly-rendered city so the
+            # user never lands on an offset computed from the *previous*
+            # city's (different-height) layout.
+            self._sync_scrollregion(self._main_cv)
+            self._sync_scrollregion(self._sb_cv)
+            self._main_cv.yview_moveto(0)
+            self._sb_cv.yview_moveto(0)
+            self._render_lock = False
+        self.root.after(100, _reattach)
+
+    def _animate_label_color(self, widget, _from, to_col, *_):
+        """Instant label color — no stacking after() chains."""
+        try:
+            widget.config(fg=to_col)
+        except tk.TclError:
+            pass
+
+    def _smooth_hover(self, widget, _from, to_col, *_):
+        """Instant background color for widget + direct children."""
+        try:
+            widget.config(bg=to_col,
+                          highlightbackground=to_col if to_col != self.CARD else self.BORDER)
+        except tk.TclError:
+            return
+        for child in widget.winfo_children():
+            try:
+                child.config(bg=to_col)
+            except tk.TclError:
+                pass
+
+    # ─────────────────────────────────────────────────────────────
+    def _render_forecast(self, daily):
+        for w in self.fc_frame.winfo_children():
+            w.destroy()
+        self._fc_cards.clear()
+        self._close_day_detail()   # reset panel on new data
+
+        codes  = daily.get('weather_code', [])
+        t_max  = daily.get('temperature_2m_max', [])
+        t_min  = daily.get('temperature_2m_min', [])
+        precip = daily.get('precipitation_probability_max', [])
+        times  = daily.get('time', [])
+        n = min(7, len(codes))
+
+        for i in range(n):
+            ic, cn = self._wx(codes[i] if i < len(codes) else 0)
+            try:
+                dt = datetime.fromisoformat(times[i])
+                day_lbl = 'Today' if i == 0 else self.DAYS_S[dt.weekday()]
+            except:
+                day_lbl = 'Today' if i == 0 else f"Day {i+1}"
+
+            is_today = (i == 0)
+            bg  = "#162d50" if is_today else self.CARD
+            bdr = self.ACCENT if is_today else self.BORDER
+
+            card = tk.Frame(self.fc_frame, bg=bg,
+                            highlightbackground=bdr, highlightthickness=1,
+                            cursor='hand2')
+            card.pack(side='left', padx=4, fill='both', expand=True)
+            self._fc_cards.append((card, is_today))
+
+            # Click → show/toggle day detail
+            for w in (card,):
+                w.bind('<Button-1>', lambda e, idx=i: self._show_day_detail(idx))
+
+            hover_bg = "#1e3a60" if is_today else "#1a2e4a"
+            card.bind('<Enter>', lambda e, w=card, nb=hover_bg, ob=bg:
+                      self._smooth_hover(w, ob, nb))
+            card.bind('<Leave>', lambda e, w=card, ob=bg, nb=hover_bg:
+                      self._smooth_hover(w, nb, ob))
+
+            day_fg = self.ACCENT2 if is_today else self.MUTED
+            for widget_data in [
+                ('label', day_lbl, ("Segoe UI", 9, "bold"),  day_fg,    (10, 2)),
+                ('label', ic,       ("Segoe UI", 26),          self.TEXT, (2,  2)),
+            ]:
+                lbl = tk.Label(card, text=widget_data[1], font=widget_data[2],
+                               bg=bg, fg=widget_data[3])
+                lbl.pack(pady=widget_data[4])
+                lbl.bind('<Button-1>', lambda e, idx=i: self._show_day_detail(idx))
+
+            hi_lbl = tk.Label(card, text=f"{self._c(t_max[i]) if i<len(t_max) else '--'}°",
+                              font=("Segoe UI", 13, "bold"), bg=bg, fg=self.TEXT)
+            hi_lbl.pack()
+            hi_lbl.bind('<Button-1>', lambda e, idx=i: self._show_day_detail(idx))
+
+            lo_lbl = tk.Label(card, text=f"{self._c(t_min[i]) if i<len(t_min) else '--'}°",
+                              font=("Segoe UI", 10), bg=bg, fg=self.MUTED2)
+            lo_lbl.pack()
+            lo_lbl.bind('<Button-1>', lambda e, idx=i: self._show_day_detail(idx))
+
+            rn_lbl = tk.Label(card, text=f"💧 {precip[i] if i<len(precip) else 0}%",
+                              font=("Segoe UI", 9), bg=bg, fg=self.ACCENT2)
+            rn_lbl.pack(pady=(2, 4))
+            rn_lbl.bind('<Button-1>', lambda e, idx=i: self._show_day_detail(idx))
+
+            cn_lbl = tk.Label(card, text=cn, font=("Segoe UI", 8), bg=bg, fg=self.MUTED2)
+            cn_lbl.pack(pady=(0, 8))
+            cn_lbl.bind('<Button-1>', lambda e, idx=i: self._show_day_detail(idx))
+
+    # ─────────────────────────────────────────────────────────────
+    def _render_table(self, daily):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        codes  = daily.get('weather_code', [])
+        t_max  = daily.get('temperature_2m_max', [])
+        t_min  = daily.get('temperature_2m_min', [])
+        precip = daily.get('precipitation_probability_max', [])
+        times  = daily.get('time', [])
+
+        for i in range(min(30, len(times))):
+            try:
+                dt   = datetime.fromisoformat(times[i].replace('Z','+00:00'))
+                ic, cn = self._wx(codes[i] if i < len(codes) else 0)
+                hi   = self._c(t_max[i])  if i < len(t_max)  else '--'
+                lo   = self._c(t_min[i])  if i < len(t_min)  else '--'
+                rain = precip[i]           if i < len(precip) else 0
+                date_str = f"{self.MONTHS[dt.month-1]} {dt.day}, {dt.year}"
+                tag = ('today' if i == 0 else ('odd' if i % 2 else ''))
+                self.tree.insert('', 'end', values=(
+                    date_str,
+                    self.DAYS_F[dt.weekday()],
+                    f"{ic} {cn[:14]}",
+                    f"H: {hi}°",
+                    f"L: {lo}°",
+                    f"{rain}%",
+                ), tags=(tag,))
+            except:
+                continue
+
+    # ─────────────────────────────────────────────────────────────
+    def _render_insights(self, daily):
+        for w in self.ins_frame.winfo_children():
+            w.destroy()
+
+        try:
+            codes    = [c for c in (daily.get('weather_code') or [])[:30] if c is not None]
+            t_max    = [float(x) for x in (daily.get('temperature_2m_max')  or [])[:30] if x is not None]
+            t_min    = [float(x) for x in (daily.get('temperature_2m_min')  or [])[:30] if x is not None]
+            precip   = [float(x) for x in (daily.get('precipitation_probability_max') or [])[:30] if x is not None]
+            times    = (daily.get('time') or [])[:30]
+            uv_arr   = [float(x) for x in (daily.get('uv_index_max')       or [])[:30] if x is not None]
+            wind_max = [float(x) for x in (daily.get('wind_speed_10m_max') or [])[:30] if x is not None]
+
+            if not t_max:
+                return
+
+            n = min(len(t_max), len(precip), len(times))
+
+            def tfmt(i):
+                try:
+                    dt = datetime.fromisoformat(times[i])
+                    return f"{self.MONTHS[dt.month-1]} {dt.day}"
+                except Exception:
+                    return f"Day {i+1}"
+
+            # 2x3 grid
+            for col in range(3):
+                self.ins_frame.columnconfigure(col, weight=1)
+
+            def make_card(row, col, title):
+                f = tk.Frame(self.ins_frame, bg=self.CARD,
+                             highlightbackground=self.BORDER, highlightthickness=1)
+                f.grid(row=row, column=col, sticky='nsew', padx=4, pady=4)
+                tk.Label(f, text=title, font=("Segoe UI", 9, "bold"),
+                         bg=self.CARD, fg=self.MUTED).pack(anchor='w', padx=10, pady=(9,5))
+                tk.Frame(f, bg=self.BORDER, height=1).pack(fill='x', padx=8)
+                return f
+
+            def irow(f, key, val, color=None, bar_pct=None):
+                r = tk.Frame(f, bg=self.CARD)
+                r.pack(fill='x', padx=10, pady=(4,0))
+                tk.Label(r, text=key, font=("Segoe UI", 8),
+                         bg=self.CARD, fg=self.MUTED2).pack(side='left')
+                tk.Label(r, text=val, font=("Segoe UI", 9, "bold"),
+                         bg=self.CARD, fg=color or self.TEXT2).pack(side='right')
+                if bar_pct is not None:
+                    bv = tk.Canvas(f, height=4, bg=self.CARD, highlightthickness=0)
+                    bv.pack(fill='x', padx=10, pady=(2,0))
+                    fc = color or self.ACCENT
+                    def _draw(cv=bv, pct=bar_pct, fc=fc):
+                        W = cv.winfo_width() or 160
+                        cv.delete('all')
+                        cv.create_rectangle(0, 0, W, 4, fill=self.BORDER, outline='')
+                        cv.create_rectangle(0, 0, max(2, int(W * min(pct,100)/100)), 4, fill=fc, outline='')
+                    bv.bind('<Configure>', lambda e, fn=_draw: fn())
+                    bv.after(60, _draw)
+
+            # Card 1: Temperature
+            c1 = make_card(0, 0, "🌡️  Temperature")
+            avg_hi = sum(t_max)/len(t_max)
+            avg_lo = sum(t_min)/len(t_min)
+            max_i  = t_max.index(max(t_max))
+            min_i  = t_min.index(min(t_min))
+            mid    = max(len(t_max)//2, 1)
+            diff   = (sum(t_max[mid:])/max(len(t_max)-mid,1)) - (sum(t_max[:mid])/mid)
+            if   diff >  1.5: trend, tc = f"▲ Warming +{round(diff,1)}°", self.DANGER
+            elif diff < -1.5: trend, tc = f"▼ Cooling {round(diff,1)}°",  self.GOOD
+            else:              trend, tc = "→ Stable",                      self.TEXT3
+            heat_days = sum(1 for t in t_max if t >= 35)
+            comf_days = sum(1 for hi, lo in zip(t_max, t_min) if 20 <= hi <= 30 and lo >= 18)
+            irow(c1, "Avg High / Low",       f"{self._c(round(avg_hi))}° / {self._c(round(avg_lo))}°", self.WARN)
+            irow(c1, "Hottest Day",          f"{tfmt(max_i)}  {self._c(t_max[max_i])}°",  self.DANGER)
+            irow(c1, "Coolest Day",          f"{tfmt(min_i)}  {self._c(t_min[min_i])}°",  self.GOOD)
+            irow(c1, "Heat Stress Days ≥35°", str(heat_days), self.DANGER if heat_days>3 else self.TEXT2)
+            irow(c1, "Comfortable Days",     str(comf_days),  self.GOOD)
+            irow(c1, "Trend",                trend,           tc)
+            tk.Label(c1, bg=self.CARD).pack(pady=4)
+
+            # Card 2: Precipitation
+            c2 = make_card(0, 1, "🌧️  Precipitation")
+            rainy   = sum(1 for r in precip if r > 40)
+            dry     = len(precip) - rainy
+            max_r_i = precip.index(max(precip))
+            avg_r   = sum(precip)/len(precip)
+            max_dry = max_wet = cur_dry = cur_wet = 0
+            for r in precip:
+                if r <= 30: cur_dry += 1; cur_wet = 0
+                else:       cur_wet += 1; cur_dry = 0
+                max_dry = max(max_dry, cur_dry)
+                max_wet = max(max_wet, cur_wet)
+            irow(c2, "Rainy / Dry Days",   f"{rainy} / {dry}", self.TEXT2)
+            irow(c2, "Heaviest Rain Day",  f"{tfmt(max_r_i)}  {int(precip[max_r_i])}%", self.DANGER, bar_pct=precip[max_r_i])
+            irow(c2, "Avg Rain Chance",    f"{round(avg_r)}%", self.TEXT2, bar_pct=avg_r)
+            irow(c2, "Longest Dry Streak", f"{max_dry} days",  self.GOOD)
+            irow(c2, "Longest Wet Streak", f"{max_wet} days",  self.WARN if max_wet>4 else self.TEXT2)
+            tk.Label(c2, bg=self.CARD).pack(pady=4)
+
+            # Card 3: UV & Sunshine
+            c3 = make_card(0, 2, "☀️  UV & Sunshine")
+            if uv_arr:
+                uv_pk_i = uv_arr.index(max(uv_arr))
+                avg_uv  = sum(uv_arr)/len(uv_arr)
+                ext_uv  = sum(1 for u in uv_arr if u >= 8)
+                high_uv = sum(1 for u in uv_arr if 6 <= u < 8)
+                mod_uv  = sum(1 for u in uv_arr if 3 <= u < 6)
+                irow(c3, "Peak UV Day",          f"{tfmt(uv_pk_i)}  UV {round(uv_arr[uv_pk_i],1)}", self.DANGER)
+                irow(c3, "Avg UV Index",         str(round(avg_uv,1)), self.WARN if avg_uv>=6 else self.TEXT2, bar_pct=min(avg_uv*8,100))
+                irow(c3, "Extreme UV Days (≥8)", str(ext_uv),  self.DANGER if ext_uv>0  else self.GOOD)
+                irow(c3, "High UV Days (6–8)",   str(high_uv), self.WARN)
+                irow(c3, "Moderate UV (3–6)",    str(mod_uv),  self.TEXT2)
+            clear_d = sum(1 for cd in codes if cd <= 1)
+            storm_d = sum(1 for cd in codes if cd >= 95)
+            irow(c3, "Clear / Sunny Days",  str(clear_d), self.GOOD)
+            irow(c3, "Thunderstorm Days",   str(storm_d), self.DANGER if storm_d>2 else self.TEXT2)
+            tk.Label(c3, bg=self.CARD).pack(pady=4)
+
+            # Card 4: Wind
+            c4 = make_card(1, 0, "💨  Wind Summary")
+            if wind_max:
+                avg_w   = sum(wind_max)/len(wind_max)
+                max_w_i = wind_max.index(max(wind_max))
+                calm    = sum(1 for w in wind_max if w < 15)
+                breezy  = sum(1 for w in wind_max if 15 <= w < 30)
+                windy   = sum(1 for w in wind_max if w >= 30)
+                irow(c4, "Avg Max Wind",         f"{round(avg_w)} km/h", self.TEXT2, bar_pct=min(avg_w*2,100))
+                irow(c4, "Windiest Day",         f"{tfmt(max_w_i)}  {round(wind_max[max_w_i])} km/h", self.WARN)
+                irow(c4, "Calm Days (<15 km/h)", str(calm),   self.GOOD)
+                irow(c4, "Breezy Days (15–30)",  str(breezy), self.TEXT2)
+                irow(c4, "Windy Days (>30 km/h)",str(windy),  self.WARN if windy>2 else self.TEXT2)
+            tk.Label(c4, bg=self.CARD).pack(pady=4)
+
+            # Card 5: Health & Comfort
+            c5 = make_card(1, 1, "🏥  Health & Comfort")
+            if t_max and precip:
+                ideal    = sum(1 for hi, r in zip(t_max, precip) if 20<=hi<=30 and r<40)
+                exercise = sum(1 for hi, r in zip(t_max, precip) if 18<=hi<=32 and r<30)
+                heat_al  = sum(1 for t in t_max if t >= 36)
+                avoid    = sum(1 for hi, r in zip(t_max, precip) if r>=75 or hi>=38)
+                score    = round((ideal/len(t_max))*100)
+                sc_col   = self.GOOD if score>=50 else (self.WARN if score>=25 else self.DANGER)
+                irow(c5, "Comfort Score",          f"{score} / 100",  sc_col, bar_pct=score)
+                irow(c5, "Ideal Outdoor Days",     str(ideal),        self.GOOD)
+                irow(c5, "Good Exercise Days",     str(exercise),     self.ACCENT2)
+                irow(c5, "Heat Alert Days (≥36°)", str(heat_al),      self.DANGER if heat_al>0 else self.GOOD)
+                irow(c5, "Stay-Indoors Days",      str(avoid),        self.DANGER if avoid>3  else self.TEXT2)
+            tk.Label(c5, bg=self.CARD).pack(pady=4)
+
+            # Card 6: Best Periods
+            c6 = make_card(1, 2, "⭐  Best Periods")
+            if n >= 3:
+                def day_score(i):
+                    r = precip[i] if i < len(precip) else 50
+                    t = t_max[i]  if i < len(t_max)  else 30
+                    return (max(0, 100 - abs(t-25)*5) + max(0, 100-r)) / 2
+                scores  = [day_score(i) for i in range(n)]
+                best_i  = scores.index(max(scores))
+                worst_i = scores.index(min(scores))
+                best3s, best3st = 0, 0
+                for i in range(n-2):
+                    s = sum(scores[i:i+3])/3
+                    if s > best3s: best3s, best3st = s, i
+                best3e  = min(best3st+2, n-1)
+                avg_sc  = sum(scores)/len(scores)
+                if   avg_sc >= 70: outlook, oc = "Excellent — mostly fine weather",  self.GOOD
+                elif avg_sc >= 55: outlook, oc = "Good — occasional disruptions",    self.GOOD
+                elif avg_sc >= 40: outlook, oc = "Mixed — plan around the rain",     self.WARN
+                elif avg_sc >= 25: outlook, oc = "Poor — mostly unsettled",          self.DANGER
+                else:              outlook, oc = "Severe — expect storms",           self.DANGER
+                irow(c6, "Best Single Day",   f"{tfmt(best_i)}  ★ {round(scores[best_i])}%",  self.GOOD)
+                irow(c6, "Best 3-Day Window", f"{tfmt(best3st)} – {tfmt(best3e)}",             self.ACCENT2)
+                irow(c6, "Worst Day",         f"{tfmt(worst_i)}  ⚠ {round(scores[worst_i])}%", self.DANGER)
+                ok = tk.Frame(c6, bg=self.CARD)
+                ok.pack(fill='x', padx=10, pady=(6,0))
+                tk.Label(ok, text="Overall Outlook", font=("Segoe UI", 8),
+                         bg=self.CARD, fg=self.MUTED2).pack(anchor='w')
+                tk.Label(ok, text=outlook, font=("Segoe UI", 9, "bold"),
+                         bg=self.CARD, fg=oc, wraplength=165, justify='left').pack(anchor='w')
+            tk.Label(c6, bg=self.CARD).pack(pady=4)
+
+            self.ins_frame.update_idletasks()
+
+        except Exception as e:
+            err = tk.Frame(self.ins_frame, bg=self.CARD,
+                           highlightbackground=self.BORDER, highlightthickness=1)
+            err.pack(fill='x', padx=4, pady=4)
+            tk.Label(err, text=f"Insights error: {e}",
+                     font=("Segoe UI", 9), bg=self.CARD, fg=self.WARN,
+                     padx=10, pady=8).pack(anchor='w')
+
+    # ─────────────────────────────────────────────────────────────
+    def _render_sidebar_extra(self, cur, daily):
+        # Resolve dew_point and cloud_cover from current hour in hourly data
+        hourly = self.weather_data.get('hourly', {}) if self.weather_data else {}
+        now    = datetime.now()
+        h_times = hourly.get('time', [])
+        h_dew   = hourly.get('dew_point_2m', [])
+        h_cloud = hourly.get('cloud_cover', [])
+        h_vis   = hourly.get('visibility', [])
+        cur_h_idx = 0
+        for i, t_str in enumerate(h_times):
+            try:
+                dt = datetime.fromisoformat(t_str.replace('Z',''))
+                if dt >= now.replace(minute=0, second=0, microsecond=0):
+                    cur_h_idx = i; break
+            except Exception:
+                pass
+        dew   = h_dew[cur_h_idx]   if cur_h_idx < len(h_dew)   else None
+        cloud = h_cloud[cur_h_idx] if cur_h_idx < len(h_cloud) else 0
+        vis   = h_vis[cur_h_idx]   if cur_h_idx < len(h_vis)   else None
+
+        # ── Wind compass ─────────────────────────────────────────
+        wind_spd  = round(cur.get('wind_speed_10m', 0))
+        wind_deg  = cur.get('wind_direction_10m', 0) or 0
+        gust_list = daily.get('wind_gusts_10m_max') or []
+        max_list  = daily.get('wind_speed_10m_max') or []
+        gust  = round(gust_list[0]) if gust_list else '--'
+        wmax  = round(max_list[0])  if max_list  else '--'
+
+        self.sb_wind_speed.config(text=f"{wind_spd} km/h")
+        self.sb_wind_gust.config( text=f"{gust} km/h" if gust != '--' else '--')
+        self.sb_wind_max.config(  text=f"{wmax} km/h" if wmax != '--' else '--')
+
+        dirs = ['N','NE','E','SE','S','SW','W','NW']
+        dir_name = dirs[round(wind_deg / 45) % 8]
+        self.sb_wind_dir_lbl.config(text=f"{dir_name}  {round(wind_deg)}°")
+        self._draw_compass(wind_deg)
+
+        # ── Humidity & Comfort ───────────────────────────────────
+        hum       = round(cur.get('relative_humidity_2m', 0))
+        dew       = cur.get('dew_point_2m')
+        cloud     = cur.get('cloud_cover', 0) or 0
+        temp_c    = cur.get('temperature_2m', 25)
+
+        # Comfort index (simplified heat index approximation)
+        if hum >= 40 and temp_c >= 27:
+            hi = (-8.784695 + 1.61139411*temp_c + 2.338549*hum
+                  - 0.14611605*temp_c*hum - 0.012308094*temp_c**2
+                  - 0.016424828*hum**2 + 0.002211732*temp_c**2*hum
+                  + 0.00072546*temp_c*hum**2 - 0.000003582*temp_c**2*hum**2)
+        else:
+            hi = temp_c
+        if   hi < 27:  comfort, comfort_fg = "Comfortable",   self.GOOD
+        elif hi < 32:  comfort, comfort_fg = "Warm",          self.TEXT2
+        elif hi < 38:  comfort, comfort_fg = "Hot",           self.WARN
+        elif hi < 45:  comfort, comfort_fg = "Very Hot",      self.DANGER
+        else:          comfort, comfort_fg = "Extreme Heat",  self.DANGER
+
+        self.sb_hum_pct.config(text=f"{hum}%")
+        c = self.sb_hum_bar
+        c.delete('all')
+        w = c.winfo_width() or 180
+        hum_color = self.GOOD if hum < 50 else (self.WARN if hum < 75 else self.DANGER)
+        c.create_rectangle(0, 0, w, 5, fill=self.BORDER, outline='')
+        c.create_rectangle(0, 0, int(w * hum / 100), 5, fill=hum_color, outline='')
+
+        dew_str = f"{self._c(dew)}°" if dew is not None else '--'
+        self.sb_dewpoint.config(text=dew_str)
+        self.sb_cloud.config(text=f"{round(cloud)}%")
+        self.sb_comfort.config(text=comfort, fg=comfort_fg)
+
+        # ── This Week ─────────────────────────────────────────────
+        for w in self.week_rows_frame.winfo_children():
+            w.destroy()
+
+        codes  = daily.get('weather_code', [])
+        t_max  = daily.get('temperature_2m_max', [])
+        t_min  = daily.get('temperature_2m_min', [])
+        times  = daily.get('time', [])
+        n7     = min(7, len(times))
+
+        all_hi  = [float(t_max[i]) for i in range(n7) if i < len(t_max)]
+        all_lo  = [float(t_min[i]) for i in range(n7) if i < len(t_min)]
+        week_min = min(all_lo)  if all_lo  else 0
+        week_max = max(all_hi)  if all_hi  else 40
+        span     = max(week_max - week_min, 1)
+
+        for i in range(n7):
+            try:
+                dt      = datetime.fromisoformat(times[i])
+                day_lbl = 'Today' if i == 0 else self.DAYS_S[dt.weekday()]
+            except:
+                day_lbl = 'Today' if i == 0 else f"D{i+1}"
+
+            hi_v  = float(t_max[i]) if i < len(t_max) else week_max
+            lo_v  = float(t_min[i]) if i < len(t_min) else week_min
+            ic, _ = self._wx(codes[i] if i < len(codes) else 0)
+
+            row_f = tk.Frame(self.week_rows_frame, bg=self.CARD)
+            row_f.pack(fill='x', pady=2)
+            row_f.columnconfigure(2, weight=1)
+
+            tk.Label(row_f, text=day_lbl, font=("Segoe UI", 8, "bold"),
+                     bg=self.CARD, fg=self.ACCENT2 if i==0 else self.TEXT3,
+                     width=4, anchor='w').grid(row=0, column=0, sticky='w')
+            tk.Label(row_f, text=ic, font=("Segoe UI", 10),
+                     bg=self.CARD).grid(row=0, column=1, padx=3)
+
+            # Temp range bar
+            bar_frame = tk.Frame(row_f, bg=self.CARD)
+            bar_frame.grid(row=0, column=2, sticky='ew', padx=(2,4))
+            bar_canvas = tk.Canvas(bar_frame, height=8, bg=self.CARD,
+                                   highlightthickness=0)
+            bar_canvas.pack(fill='x', expand=True)
+
+            def draw_bar(cv=bar_canvas, lo=lo_v, hi=hi_v, mn=week_min, sp=span):
+                W = cv.winfo_width() or 80
+                cv.delete('all')
+                cv.create_rectangle(0, 1, W, 7, fill=self.BORDER, outline='')
+                x1 = int((lo - mn) / sp * W)
+                x2 = int((hi - mn) / sp * W)
+                x2 = max(x2, x1 + 4)
+                cv.create_rectangle(x1, 1, x2, 7, fill=self.ACCENT, outline='')
+            bar_canvas.bind('<Configure>', lambda e, fn=draw_bar: fn())
+            bar_canvas.after(50, draw_bar)
+
+            tk.Label(row_f, text=f"{self._c(lo_v)}°",
+                     font=("Segoe UI", 8), bg=self.CARD, fg=self.MUTED2,
+                     width=4, anchor='e').grid(row=0, column=3)
+            tk.Label(row_f, text=f"{self._c(hi_v)}°",
+                     font=("Segoe UI", 8, "bold"), bg=self.CARD, fg=self.WARN,
+                     width=4, anchor='w').grid(row=0, column=4)
+
+        # ── Health & Activity ────────────────────────────────────
+        uv_val  = (daily.get('uv_index_max') or [0])[0] or 0
+        rain0   = (daily.get('precipitation_probability_max') or [0])[0] or 0
+        feels   = cur.get('apparent_temperature', temp_c)
+
+        # UV advice
+        if   uv_val < 3:  uv_adv, uv_fg = "Low — no protection needed", self.GOOD
+        elif uv_val < 6:  uv_adv, uv_fg = "Moderate — wear sunscreen",  self.TEXT2
+        elif uv_val < 8:  uv_adv, uv_fg = "High — SPF 30+ required",    self.WARN
+        elif uv_val < 11: uv_adv, uv_fg = "Very High — limit exposure",  self.DANGER
+        else:             uv_adv, uv_fg = "Extreme — stay indoors",      self.DANGER
+        self.sb_uv_advice.config(text=uv_adv, fg=uv_fg)
+
+        # Exercise
+        if rain0 > 70 or hi > 38:
+            ex_adv, ex_fg = "Avoid outdoor exercise", self.DANGER
+        elif rain0 > 40 or hi > 33:
+            ex_adv, ex_fg = "Light indoor activity",  self.WARN
+        elif hi < 20:
+            ex_adv, ex_fg = "Great for outdoor sport", self.GOOD
+        else:
+            ex_adv, ex_fg = "Good — stay hydrated",   self.GOOD
+        self.sb_exercise.config(text=ex_adv, fg=ex_fg)
+
+        # Air quality (estimated from humidity + cloud + wind)
+        if wind_spd > 20 and cloud < 50:
+            aq, aq_fg = "Good",        self.GOOD
+        elif hum > 80 or cloud > 80:
+            aq, aq_fg = "Moderate",    self.WARN
+        else:
+            aq, aq_fg = "Acceptable",  self.TEXT2
+        self.sb_air.config(text=aq, fg=aq_fg)
+
+        # Wind chill / heat advice
+        feels_c = round(feels)
+        if feels_c < 10:
+            wc_txt, wc_fg = f"Cold — feels {self._c(feels)}°",   self.ACCENT2
+        elif feels_c < 20:
+            wc_txt, wc_fg = f"Cool — feels {self._c(feels)}°",   self.TEXT2
+        elif feels_c < 32:
+            wc_txt, wc_fg = f"Warm — feels {self._c(feels)}°",   self.TEXT2
+        else:
+            wc_txt, wc_fg = f"Hot — feels {self._c(feels)}°",    self.DANGER
+        self.sb_windchill.config(text=wc_txt, fg=wc_fg)
+
+        # Rain risk
+        if   rain0 < 20:  rr_txt, rr_fg = f"Low ({rain0}%)",      self.GOOD
+        elif rain0 < 50:  rr_txt, rr_fg = f"Possible ({rain0}%)", self.TEXT2
+        elif rain0 < 75:  rr_txt, rr_fg = f"Likely ({rain0}%)",   self.WARN
+        else:             rr_txt, rr_fg = f"Very likely ({rain0}%)", self.DANGER
+        self.sb_rain_risk.config(text=rr_txt, fg=rr_fg)
+
+    # ─────────────────────────────────────────────────────────────
+    def _draw_compass(self, deg):
+        c = self.compass_cv
+        c.delete('all')
+        cx, cy, r = 34, 34, 30
+
+        # Outer ring
+        c.create_oval(cx-r, cy-r, cx+r, cy+r,
+                      outline=self.BORDER, width=2, fill=self.BG)
+        # Cardinal labels
+        for label, angle in [('N',0),('E',90),('S',180),('W',270)]:
+            rad = math.radians(angle - 90)
+            lx  = cx + (r - 8) * math.cos(rad)
+            ly  = cy + (r - 8) * math.sin(rad)
+            c.create_text(lx, ly, text=label, font=("Segoe UI", 7, "bold"),
+                          fill=self.MUTED2 if label != 'N' else self.ACCENT2)
+        # Tick marks
+        for a in range(0, 360, 45):
+            rad  = math.radians(a - 90)
+            x1 = cx + (r-2)  * math.cos(rad)
+            y1 = cy + (r-2)  * math.sin(rad)
+            x2 = cx + (r-6)  * math.cos(rad)
+            y2 = cy + (r-6)  * math.sin(rad)
+            c.create_line(x1, y1, x2, y2, fill=self.BORDER, width=1)
+        # Arrow
+        rad    = math.radians(deg - 90)
+        tip_x  = cx + (r - 12) * math.cos(rad)
+        tip_y  = cy + (r - 12) * math.sin(rad)
+        tail_x = cx - (r - 18) * math.cos(rad)
+        tail_y = cy - (r - 18) * math.sin(rad)
+        c.create_line(tail_x, tail_y, tip_x, tip_y,
+                      fill=self.ACCENT2, width=2, arrow='last',
+                      arrowshape=(8, 10, 4))
+        # Centre dot
+        c.create_oval(cx-3, cy-3, cx+3, cy+3,
+                      fill=self.ACCENT, outline=self.ACCENT2)
+
+    # ══════════════════════════════════════════════════════════════
+    # HELPERS
+    # ══════════════════════════════════════════════════════════════
+    def _wx(self, code):
+        return self._WX.get(code, ('🌡️', 'Unknown'))
+
+    def _c(self, t):
+        return round((float(t) * 9/5) + 32) if self.unit == 'fahrenheit' else round(float(t))
+
+    def _set_unit(self, u):
+        self.unit = u
+        self.c_btn.config(bg=self.ACCENT if u=='celsius'    else self.CARD,
+                          fg='white'     if u=='celsius'    else self.MUTED)
+        self.f_btn.config(bg=self.ACCENT if u=='fahrenheit' else self.CARD,
+                          fg='white'     if u=='fahrenheit' else self.MUTED)
+        if self.weather_data:
+            self._render(self.last_city, self.last_country)
+
+    def _clear_placeholder(self):
+        if self.search_var.get() == "Search city...":
+            self.search_entry.delete(0, 'end')
+            self.search_entry.config(fg=self.TEXT2)
+
+    def _restore_placeholder(self):
+        if not self.search_var.get():
+            self.search_entry.insert(0, "Search city...")
+            self.search_entry.config(fg=self.MUTED2)
+
+    def _save_city(self, city):
+        try:
+            with open('last_city.txt', 'w') as f:
+                f.write(city)
+        except: pass
+
+    def _load_last_city(self):
+        try:
+            if os.path.exists('last_city.txt'):
+                city = open('last_city.txt').read().strip()
+                if city:
+                    self._do_search(city)
+        except: pass
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app  = MasrurWeather(root)
+    root.mainloop()
